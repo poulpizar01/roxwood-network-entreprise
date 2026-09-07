@@ -5,6 +5,7 @@ import { refreshAllPanelsAcrossGuilds } from "../services/panelService.js";
 import { refreshAllRecruitmentStatusMessages } from "../services/recruitmentLogService.js";
 import { startSheetSyncPolling } from "../services/sheetSyncService.js";
 import { startWebhookRetryPolling } from "../services/webhookDispatcher.js";
+import { runRetentionJob, startRetentionPolling } from "../services/retentionService.js";
 import { logger } from "../utils/logger.js";
 
 /**
@@ -58,4 +59,8 @@ export async function onReady(readyClient: Client<true>): Promise<void> {
 
   startWebhookRetryPolling();
   logger.info("Sondage des livraisons webhook a reessayer demarre");
+
+  runRetentionJob().catch((error) => logger.error("Echec de la premiere purge de retention au demarrage", error));
+  startRetentionPolling();
+  logger.info("Purge de retention demarree (logs monitoring, pieces jointes de tickets fermes)");
 }

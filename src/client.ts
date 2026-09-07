@@ -10,6 +10,10 @@ import { Client, GatewayIntentBits, Partials } from "discord.js";
  * Les `partials` Channel/Message/Reaction permettent de recevoir des evenements sur des objets non
  * entierement mis en cache (ex: message ou reaction plus vieux que le cache, notamment apres un
  * redemarrage) sans que discord.js les ignore silencieusement.
+ * `sweepers.messages` : sans balayage, discord.js garde par defaut jusqu'a 200 messages par
+ * salon en cache indefiniment — sur un serveur avec beaucoup de salons actifs, ca ne redescend
+ * jamais. Les messages retires du cache restent recuperables via `Partials.Message` si un
+ * evenement les reference encore (ex: reaction 🗑️ tardive sur un message de panneau).
  */
 export const client = new Client({
   intents: [
@@ -20,4 +24,10 @@ export const client = new Client({
     GatewayIntentBits.GuildMessageReactions,
   ],
   partials: [Partials.Channel, Partials.Message, Partials.Reaction],
+  sweepers: {
+    messages: {
+      interval: 3600, // toutes les heures
+      lifetime: 1800, // retire les messages en cache depuis plus de 30 minutes
+    },
+  },
 });

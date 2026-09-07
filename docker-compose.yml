@@ -13,6 +13,11 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   bot:
     build: .
@@ -25,6 +30,15 @@ services:
       CLIENT_ID: ${CLIENT_ID}
       DEV_GUILD_ID: ${DEV_GUILD_ID}
       DATABASE_URL: postgresql://${POSTGRES_USER:-roxwood_network}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-roxwood_network}
+    # Limite volontairement large pour un bot Discord de cette taille : protege le VPS entier
+    # (partage avec d'autres services) contre une fuite memoire du bot, sans le faire tomber
+    # dans des conditions normales d'usage.
+    mem_limit: 512m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
 volumes:
   db_data:

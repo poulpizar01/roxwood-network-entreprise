@@ -1,5 +1,5 @@
 import { prisma } from "../db/prisma.js";
-import { dispatchCustomWebhook } from "./webhookDispatcher.js";
+import { dispatchToSubscription, findActiveSubscription } from "./webhookDispatcher.js";
 import { logger } from "../utils/logger.js";
 
 /**
@@ -13,6 +13,8 @@ import { logger } from "../utils/logger.js";
 
 /** Sonde les Sheets actifs toutes les 5 minutes — assez reactif sans spammer les recepteurs. */
 const POLL_INTERVAL_MS = 5 * 60 * 1000;
+/** Delai maximum accorde a la lecture d'un Sheet avant d'abandonner cette synchronisation pour cette passe. */
+const FETCH_TIMEOUT_MS = 10_000;
 
 /**
  * Convertit un lien Google Sheets classique (partage/edition, avec ou sans `#gid=`) en URL
@@ -94,7 +96,7 @@ function parseCsv(text: string): string[][] {
  * pour toute personne avec le lien".
  */
 export async function fetchSheetRows(csvUrl: string): Promise<string[][]> {
-  const response = await fetch(csvUrl);
+  const response = await fetch(csvUrl, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
   if (!response.ok) {
     throw new Error(
       `Impossible de lire le Sheet (HTTP ${response.status}) — vérifie qu'il est bien partagé "Lecture" pour "Toute personne avec le lien".`
@@ -110,6 +112,10 @@ export async function fetchSheetRows(csvUrl: string): Promise<string[][]> {
  * toutes les donnees deja saisies, pas seulement celles qui arriveront apres coup. Le compteur
  * `lastRowCount` n'est mis a jour qu'une fois cet envoi initial termine, pour que le sondage
  * periodique ne renvoie pas ces memes lignes une seconde fois.
+ *
+ * L'abonnement webhook cible est charge une seule fois avant la boucle (`findActiveSubscription`)
+ * plutot que redemande a chaque ligne : sur un Sheet de plusieurs centaines/milliers de lignes,
+ * ca evite autant de requetes en base pour retrouver a chaque fois le meme abonnement.
  */
 export async function createSheetSync(guildId: string, subscriptionId: string, rawSheetUrl: string) {
   const sheetUrl = parseGoogleSheetUrl(rawSheetUrl);
@@ -118,12 +124,15 @@ export async function createSheetSync(guildId: string, subscriptionId: string, r
 
   if (rows.length > 1) {
     const [headers, ...dataRows] = rows;
-    for (const rowValues of dataRows) {
-      const payload: Record<string, string> = {};
-      headers.forEach((header, index) => {
-        if (header) payload[header] = rowValues[index] ?? "";
-      });
-      await dispatchCustomWebhook(guildId, subscriptionId, payload);
+    const sub = await findActiveSubscription(guildId, subscriptionId);
+    if (sub) {
+      for (const rowValues of dataRows) {
+        const payload: Record<string, string> = {};
+        headers.forEach((header, index) => {
+          if (header) payload[header] = rowValues[index] ?? "";
+        });
+        await dispatchToSubscription(sub, guildId, payload);
+      }
     }
     await prisma.sheetSync.update({ where: { id: sync.id }, data: { lastRowCount: dataRows.length } });
   }
@@ -164,12 +173,17 @@ export async function pollAllSheetSyncs(): Promise<void> {
 
       if (currentCount > sync.lastRowCount) {
         const newRows = dataRows.slice(sync.lastRowCount);
-        for (const rowValues of newRows) {
-          const payload: Record<string, string> = {};
-          headers.forEach((header, index) => {
-            if (header) payload[header] = rowValues[index] ?? "";
-          });
-          await dispatchCustomWebhook(sync.guildId, sync.subscriptionId, payload);
+        // Charge l'abonnement une seule fois pour tout ce lot de nouvelles lignes, plutot
+        // qu'a chaque ligne (voir `findActiveSubscription`).
+        const sub = await findActiveSubscription(sync.guildId, sync.subscriptionId);
+        if (sub) {
+          for (const rowValues of newRows) {
+            const payload: Record<string, string> = {};
+            headers.forEach((header, index) => {
+              if (header) payload[header] = rowValues[index] ?? "";
+            });
+            await dispatchToSubscription(sub, sync.guildId, payload);
+          }
         }
       }
 
@@ -184,7 +198,17 @@ export async function pollAllSheetSyncs(): Promise<void> {
 
 /** Demarre le sondage periodique — a appeler une seule fois au demarrage du bot (voir `ready.ts`). */
 export function startSheetSyncPolling(): void {
+  // Verrou de re-entrance : sans lui, un Sheet volumineux ou lent a repondre pourrait faire
+  // chevaucher deux passes et renvoyer certaines lignes en double (le compteur `lastRowCount`
+  // n'est mis a jour qu'a la fin du traitement de chaque synchronisation).
+  let isRunning = false;
   setInterval(() => {
-    pollAllSheetSyncs().catch((error) => logger.error("Erreur inattendue lors du sondage des Google Sheets", error));
+    if (isRunning) return;
+    isRunning = true;
+    pollAllSheetSyncs()
+      .catch((error) => logger.error("Erreur inattendue lors du sondage des Google Sheets", error))
+      .finally(() => {
+        isRunning = false;
+      });
   }, POLL_INTERVAL_MS);
 }

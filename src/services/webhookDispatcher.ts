@@ -63,6 +63,13 @@ function sign(secret: string, body: string): string {
 const MAX_DELIVERY_ATTEMPTS = 10;
 /** Sonde les livraisons a reessayer toutes les minutes. */
 const RETRY_POLL_INTERVAL_MS = 60 * 1000;
+/**
+ * Delai maximum accorde a un envoi avant de le considerer en echec — sans ca, un recepteur
+ * qui accepte la connexion sans jamais repondre bloquerait indefiniment (fetch n'a pas de
+ * timeout par defaut), et avec le sondage periodique ci-dessous, un chevauchement de passes
+ * pourrait alors declencher des envois en double.
+ */
+const FETCH_TIMEOUT_MS = 10_000;
 
 /** Delai avant la Nieme tentative : 1, 2, 4, 8... minutes, plafonne a 30 minutes. */
 function nextAttemptDelayMs(attempts: number): number {
@@ -88,6 +95,7 @@ async function attemptDelivery(sub: { id: string; url: string; secret: string },
         "X-Signature-256": sign(sub.secret, body),
       },
       body,
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
     });
     if (response.ok) return { ok: true };
     logger.warn(`Webhook ${sub.id} (${eventType}) a repondu ${response.status}`);
@@ -164,8 +172,18 @@ export async function retryFailedDeliveries(): Promise<void> {
 
 /** Demarre le sondage periodique des livraisons a reessayer — a appeler une seule fois au demarrage du bot (voir `ready.ts`). */
 export function startWebhookRetryPolling(): void {
+  // Verrou de re-entrance : si une passe depasse l'intervalle (beaucoup de livraisons en
+  // attente, recepteur lent), la suivante ne doit pas demarrer par-dessus au risque de
+  // retenter la meme livraison deux fois en parallele.
+  let isRunning = false;
   setInterval(() => {
-    retryFailedDeliveries().catch((error) => logger.error("Erreur inattendue lors du sondage des webhooks a reessayer", error));
+    if (isRunning) return;
+    isRunning = true;
+    retryFailedDeliveries()
+      .catch((error) => logger.error("Erreur inattendue lors du sondage des webhooks a reessayer", error))
+      .finally(() => {
+        isRunning = false;
+      });
   }, RETRY_POLL_INTERVAL_MS);
 }
 
@@ -200,23 +218,48 @@ export async function dispatchWebhook(
 }
 
 /**
+ * Recupere un abonnement webhook actif par id (verifie qu'il appartient bien a la guilde) — a
+ * charger une seule fois avant une boucle qui dispatche plusieurs evenements vers le meme
+ * abonnement (voir `dispatchToSubscription`), typiquement une synchronisation Google Sheet qui
+ * envoie une ligne par evenement : sans ca, chaque ligne redeclenchait la meme recherche en
+ * base pour retrouver un abonnement pourtant identique a chaque fois.
+ */
+export async function findActiveSubscription(guildId: string, subscriptionId: string) {
+  return prisma.webhookSubscription.findFirst({ where: { id: subscriptionId, guildId, enabled: true } });
+}
+
+/**
+ * Envoie un contenu libre a un abonnement deja charge (pas de nouvelle recherche en base) —
+ * voir `findActiveSubscription`. Pas de fanout par type : un seul abonnement cible, meme
+ * raisonnement que `dispatchWebhook` mais pour un seul destinataire choisi explicitement.
+ */
+export async function dispatchToSubscription(
+  sub: { id: string; url: string; secret: string; eventType: string; label: string | null },
+  guildId: string,
+  payload: Record<string, unknown>
+): Promise<void> {
+  const body = JSON.stringify({ guildId, eventType: sub.eventType, label: sub.label, payload, sentAt: new Date().toISOString() });
+  await post(sub, body, sub.eventType);
+}
+
+/**
  * Envoie un contenu libre a **un seul** abonnement "custom" choisi explicitement par le staff
  * (pas de fanout par type — plusieurs abonnements custom d'une meme guilde, ex: un par Google
  * Sheet, doivent pouvoir recevoir des contenus completement differents sans se marcher dessus).
  * Retourne `false` sans rien envoyer si l'abonnement n'existe pas/plus ou n'appartient pas a
- * cette guilde (verification d'isolation, meme raisonnement que `dispatchWebhook`).
+ * cette guilde (verification d'isolation, meme raisonnement que `dispatchWebhook`). Pour un
+ * envoi ponctuel ; si plusieurs evenements doivent partir vers le meme abonnement de suite,
+ * preferer `findActiveSubscription` + `dispatchToSubscription` pour ne charger l'abonnement
+ * qu'une seule fois.
  */
 export async function dispatchCustomWebhook(
   guildId: string,
   subscriptionId: string,
   payload: Record<string, unknown>
 ): Promise<boolean> {
-  const sub = await prisma.webhookSubscription.findFirst({
-    where: { id: subscriptionId, guildId, enabled: true },
-  });
+  const sub = await findActiveSubscription(guildId, subscriptionId);
   if (!sub) return false;
 
-  const body = JSON.stringify({ guildId, eventType: sub.eventType, label: sub.label, payload, sentAt: new Date().toISOString() });
-  await post(sub, body, sub.eventType);
+  await dispatchToSubscription(sub, guildId, payload);
   return true;
 }
