@@ -31,11 +31,17 @@ export async function removeItem(guildId: string, id: string) {
   await prisma.catalogItem.deleteMany({ where: { id, guildId } });
 }
 
-/** Liste les articles actifs d'une guilde, dans l'ordre de creation (utilise pour le menu deroulant client). */
+/**
+ * Liste les articles actifs d'une guilde, dans l'ordre de creation (utilise pour le menu
+ * deroulant client). `omit: { imageData: true }` : aucun appelant n'affiche la photo depuis
+ * cette liste (juste nom/prix/description dans un menu), inutile de charger potentiellement
+ * plusieurs Mo d'octets par article a chaque ouverture de ticket Service.
+ */
 export async function listActive(guildId: string) {
   return prisma.catalogItem.findMany({
     where: { guildId, active: true },
     orderBy: { createdAt: "asc" },
+    omit: { imageData: true },
   });
 }
 
@@ -59,12 +65,18 @@ export function buildCatalogSelectOptions(items: { id: string; name: string; pri
   });
 }
 
-/** Comme `listActive`, avec les champs personnalises inclus — pour le recapitulatif du panneau. */
+/**
+ * Comme `listActive`, avec les champs personnalises inclus — pour le recapitulatif du
+ * panneau. Meme raisonnement pour `omit: { imageData: true }` : la presence d'une photo se
+ * verifie via `imageFilename` (toujours defini en meme temps que `imageData`, voir
+ * `setItemImage`), pas besoin des octets eux-memes pour ce simple indicateur.
+ */
 export async function listActiveWithFields(guildId: string) {
   return prisma.catalogItem.findMany({
     where: { guildId, active: true },
     orderBy: { createdAt: "asc" },
     include: { fields: { orderBy: { position: "asc" } } },
+    omit: { imageData: true },
   });
 }
 
@@ -91,9 +103,21 @@ export async function setItemWeight(guildId: string, id: string, weightGrams: nu
 /**
  * Recupere un article (avec ses champs personnalises, ordonnes par `position`) en verifiant
  * qu'il appartient bien a la guilde donnee — evite qu'un id d'article d'un autre serveur
- * puisse etre utilise par erreur ou malveillance.
+ * puisse etre utilise par erreur ou malveillance. `omit: { imageData: true }` : la quasi
+ * totalite des appelants (composition de commande, gestion du poids/des champs...) n'ont
+ * besoin que du nom/prix/champs, jamais des octets de la photo — voir `getItemWithImage` pour
+ * le seul appelant qui en a reellement besoin (confirmation d'article cote client).
  */
 export async function getItem(guildId: string, id: string) {
+  return prisma.catalogItem.findFirst({
+    where: { id, guildId },
+    include: { fields: { orderBy: { position: "asc" } } },
+    omit: { imageData: true },
+  });
+}
+
+/** Comme `getItem`, avec les octets de la photo inclus — pour l'affichage de la confirmation d'article. */
+export async function getItemWithImage(guildId: string, id: string) {
   return prisma.catalogItem.findFirst({
     where: { id, guildId },
     include: { fields: { orderBy: { position: "asc" } } },
@@ -144,38 +168,3 @@ export async function removeField(guildId: string, fieldId: string) {
   });
 }
 
-/** Liste les champs personnalises d'un article (tableau vide si l'article n'existe pas). */
-export async function listFields(guildId: string, itemId: string) {
-  const item = await getItem(guildId, itemId);
-  return item?.fields ?? [];
-}
-
-/**
- * Recherche des articles par nom (sous-chaine, insensible a la casse), tous statuts
- * confondus (actifs ou non — le staff doit pouvoir retrouver un article desactive pour le
- * consulter/reactiver). Utilise par l'autocomplete des commandes `/catalog` pour eviter au
- * staff de devoir copier-coller un id opaque.
- */
-export async function searchItems(guildId: string, query: string) {
-  return prisma.catalogItem.findMany({
-    where: { guildId, name: { contains: query, mode: "insensitive" } },
-    orderBy: { createdAt: "asc" },
-    take: 25,
-  });
-}
-
-/**
- * Recherche des champs personnalises (avec leur article parent) par libelle de champ ou
- * nom d'article, pour l'autocomplete de `/catalog field-remove`.
- */
-export async function searchFields(guildId: string, query: string) {
-  return prisma.catalogItemField.findMany({
-    where: {
-      catalogItem: { guildId },
-      OR: [{ label: { contains: query, mode: "insensitive" } }, { catalogItem: { name: { contains: query, mode: "insensitive" } } }],
-    },
-    include: { catalogItem: true },
-    orderBy: { position: "asc" },
-    take: 25,
-  });
-}

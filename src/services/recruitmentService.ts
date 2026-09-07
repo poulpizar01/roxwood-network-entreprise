@@ -11,6 +11,15 @@ import { dispatchWebhook } from "./webhookDispatcher.js";
  */
 
 /**
+ * Nombre maximum de pieces jointes par candidature — seul point ou un membre non-staff (le
+ * candidat) peut declencher directement une ecriture en base depuis un contenu qu'il controle
+ * entierement (voir `handleRecruitmentFinishAttachments`). Sans plafond, rien n'empecherait d'y
+ * pousser un nombre arbitraire de fichiers (la taille par fichier est plafonnee separement,
+ * voir `MAX_UPLOAD_SIZE_BYTES` dans `imageAttachment.ts`).
+ */
+export const MAX_RECRUITMENT_ATTACHMENTS = 3;
+
+/**
  * Envoie l'etat complet et courant d'une candidature sur l'unique evenement
  * `recruitment.updated` — meme principe que `absence.updated`/`order.updated` : un recepteur
  * n'a qu'un seul type d'evenement a ecouter pour toujours avoir la derniere version d'une
@@ -21,7 +30,7 @@ import { dispatchWebhook } from "./webhookDispatcher.js";
  */
 async function dispatchRecruitmentUpdated(ticketId: string): Promise<void> {
   const ticket = await getTicketById(ticketId);
-  const application = await getApplication(ticketId);
+  const application = await getApplicationSummary(ticketId);
   if (!ticket || !application) return;
 
   await dispatchWebhook(ticket.guildId, "recruitment.updated", {
@@ -92,23 +101,71 @@ export async function saveLogMessageRef(ticketId: string, logChannelId: string, 
 }
 
 /**
- * Rattache une piece jointe (image, document) envoyee par le candidat en message classique
- * dans le salon du ticket — les modals Discord ne supportent pas l'upload de fichier, c'est
- * donc le seul moyen technique de joindre des fichiers a une candidature. Les octets (deja
- * telecharges par l'appelant depuis l'URL CDN Discord, voir `messageCreate.ts`) sont stockes
- * directement plutot que cette URL, qui est signee et expire.
+ * Rattache en une seule fois toutes les pieces jointes (image, document) que le candidat a
+ * envoyees en message classique dans le salon du ticket, une fois qu'il a clique "J'ai terminé"
+ * (voir `handleRecruitmentFinishAttachments`) — les modals Discord ne supportant pas l'upload
+ * de fichier, c'est le seul moyen technique de joindre des fichiers a une candidature. Les
+ * octets (deja telecharges par l'appelant depuis l'URL CDN Discord) sont stockes directement
+ * plutot que cette URL, qui est signee et expire. Un seul `dispatchRecruitmentUpdated` pour
+ * tout le lot plutot qu'un par fichier — evite de spammer les webhooks abonnes d'un evenement
+ * par piece jointe alors qu'elles arrivent toutes ensemble, en une seule action candidat.
  */
-export async function addAttachment(ticketId: string, data: Buffer, filename: string) {
+export async function addAttachments(ticketId: string, files: { data: Buffer; filename: string }[]) {
+  if (files.length === 0) return [];
+
   const application = await prisma.recruitmentApplication.findUniqueOrThrow({ where: { ticketId } });
-  const attachment = await prisma.recruitmentAttachment.create({ data: { applicationId: application.id, data, filename } });
+  const created = await prisma.$transaction(
+    files.map((f) => prisma.recruitmentAttachment.create({ data: { applicationId: application.id, data: f.data, filename: f.filename } }))
+  );
   await dispatchRecruitmentUpdated(ticketId);
-  return attachment;
+  return created;
 }
 
-/** Recupere la candidature d'un ticket avec ses reponses et pieces jointes, ou `null` si aucune n'existe. */
+/**
+ * Enregistre l'URL Discord CDN finale de chaque piece jointe image, capturee juste apres
+ * l'envoi initial du message de suivi (voir `finalizeRecruitmentAttachments`) — reutilisee
+ * ensuite par tout rafraichissement du message sans jamais re-uploader les octets ni toucher
+ * aux pieces jointes du message (voir le commentaire sur `RecruitmentAttachment.discordUrl`
+ * dans le schema).
+ */
+export async function setAttachmentDiscordUrls(urls: { attachmentId: string; discordUrl: string }[]) {
+  if (urls.length === 0) return;
+  await prisma.$transaction(
+    urls.map((u) => prisma.recruitmentAttachment.update({ where: { id: u.attachmentId }, data: { discordUrl: u.discordUrl } }))
+  );
+}
+
+/**
+ * Recupere la candidature d'un ticket avec ses reponses et pieces jointes (octets compris),
+ * ou `null` si aucune n'existe — a n'utiliser que quand les octets sont reellement necessaires
+ * (voir `finalizeRecruitmentAttachments`, qui doit uploader les fichiers une premiere et
+ * unique fois). Pour tout le reste (verifier un statut, construire le payload d'un webhook,
+ * rafraichir le texte du message de suivi...), preferer `getApplicationSummary`.
+ */
 export async function getApplication(ticketId: string) {
   return prisma.recruitmentApplication.findUnique({
     where: { ticketId },
     include: { answers: true, attachments: true },
+  });
+}
+
+/**
+ * Comme `getApplication`, sans les octets des pieces jointes (juste leur nom et l'URL Discord
+ * deja resolue de l'image, voir `RecruitmentAttachment.discordUrl`) — pour les usages qui n'ont
+ * besoin que de metadonnees (verifier un statut, construire le payload d'un webhook, rafraichir
+ * le texte du message de suivi) et n'ont jamais besoin de re-uploader un fichier.
+ */
+export async function getApplicationSummary(ticketId: string) {
+  return prisma.recruitmentApplication.findUnique({
+    where: { ticketId },
+    select: {
+      status: true,
+      recruiterId: true,
+      submittedAt: true,
+      logChannelId: true,
+      logMessageId: true,
+      answers: { select: { question: true, answer: true } },
+      attachments: { select: { filename: true, discordUrl: true } },
+    },
   });
 }

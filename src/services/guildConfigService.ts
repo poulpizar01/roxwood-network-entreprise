@@ -16,8 +16,16 @@ import { prisma } from "../db/prisma.js";
  * bot ne lit/ecrit jamais que les donnees du serveur sur lequel l'evenement/la commande a eu lieu.
  */
 
-/** GuildConfig avec ses categories de tickets et salons de monitoring deja charges (evite un aller-retour DB supplementaire). */
-type GuildConfigWithCategories = GuildConfig & {
+/**
+ * GuildConfig avec ses categories de tickets et salons de monitoring deja charges (evite un
+ * aller-retour DB supplementaire) — sans `shopBannerData` : cette config est mise en cache et
+ * relue a quasiment chaque evenement Discord (channelCreate, messageCreate, chaque
+ * interaction...), alors que les octets de la banniere ne servent qu'a la generation d'une
+ * facture (voir `getShopBanner` ci-dessous, interroge separement a la demande). Omettre le
+ * champ ici force une erreur de compilation si un appelant tente d'y acceder par erreur sur
+ * cette config partagee, plutot qu'un `undefined` silencieux a l'execution.
+ */
+type GuildConfigWithCategories = Omit<GuildConfig, "shopBannerData"> & {
   ticketCategories: TicketCategoryConfig[];
   monitoringChannels: MonitoringChannelConfig[];
 };
@@ -40,9 +48,24 @@ export async function getGuildConfig(guildId: string): Promise<GuildConfigWithCa
   const config = await prisma.guildConfig.findUnique({
     where: { guildId },
     include: { ticketCategories: true, monitoringChannels: true },
+    omit: { shopBannerData: true },
   });
   if (config) cache.set(guildId, config);
   return config;
+}
+
+/**
+ * Recupere les octets de la banniere de facture, en dehors du cache partage (voir
+ * `GuildConfigWithCategories`) — interrogee uniquement au moment de generer une facture
+ * (`orderLogService.ts`), un evenement bien plus rare qu'un message/une interaction.
+ */
+export async function getShopBanner(guildId: string): Promise<{ shopBannerData: Buffer; shopBannerFilename: string } | null> {
+  const config = await prisma.guildConfig.findUnique({
+    where: { guildId },
+    select: { shopBannerData: true, shopBannerFilename: true },
+  });
+  if (!config?.shopBannerData || !config.shopBannerFilename) return null;
+  return { shopBannerData: Buffer.from(config.shopBannerData), shopBannerFilename: config.shopBannerFilename };
 }
 
 /**
@@ -69,6 +92,7 @@ async function ensureGuildConfig(guildId: string): Promise<GuildConfigWithCatego
       create: { guildId },
       update: {},
       include: { ticketCategories: true, monitoringChannels: true },
+      omit: { shopBannerData: true },
     });
     cache.set(guildId, config);
     return config;
@@ -85,6 +109,7 @@ async function refresh(guildId: string): Promise<GuildConfigWithCategories> {
   const config = await prisma.guildConfig.findUniqueOrThrow({
     where: { guildId },
     include: { ticketCategories: true, monitoringChannels: true },
+    omit: { shopBannerData: true },
   });
   cache.set(guildId, config);
   return config;
@@ -110,8 +135,11 @@ export async function setCategoryForType(
   const existingForType = config.ticketCategories.find((c) => c.type === type);
 
   if (existingForType && existingForType.categoryId !== categoryId) {
-    await prisma.ticketCategoryConfig.delete({
-      where: { guildId_categoryId: { guildId, categoryId: existingForType.categoryId } },
+    // `deleteMany` plutot que `delete` : si deux admins changent la categorie de ce type
+    // presque simultanement, le second appel ne doit pas planter (P2025) parce que le premier
+    // a deja supprime cette ligne — `deleteMany` ne trouve simplement rien a supprimer.
+    await prisma.ticketCategoryConfig.deleteMany({
+      where: { guildId, categoryId: existingForType.categoryId },
     });
   }
 
@@ -128,7 +156,7 @@ export async function clearCategoryForType(guildId: string, type: TicketType): P
   const config = await ensureGuildConfig(guildId);
   const existing = config.ticketCategories.find((c) => c.type === type);
   if (existing) {
-    await prisma.ticketCategoryConfig.delete({ where: { guildId_categoryId: { guildId, categoryId: existing.categoryId } } });
+    await prisma.ticketCategoryConfig.deleteMany({ where: { guildId, categoryId: existing.categoryId } });
   }
   return refresh(guildId);
 }

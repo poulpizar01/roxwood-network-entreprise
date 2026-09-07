@@ -1,5 +1,6 @@
 generator client {
-  provider = "prisma-client-js"
+  provider        = "prisma-client-js"
+  previewFeatures = ["omitApi"]
 }
 
 datasource db {
@@ -277,6 +278,14 @@ model RecruitmentAttachment {
   /// cesse de repondre des que le message d'origine est supprime).
   data          Bytes
   filename      String
+  /// URL Discord CDN de l'image telle qu'affichee dans le message de suivi, capturee une seule
+  /// fois juste apres l'envoi initial (voir `finalizeRecruitmentAttachments`) — reutilisee pour
+  /// tout rafraichissement ulterieur du message (changement de statut, assignation) afin de ne
+  /// jamais re-uploader les octets ni introduire une nouvelle reference `attachment://` dans
+  /// une edition : Discord ne persiste pas de facon fiable l'image d'un embed nouvellement
+  /// ajoute a un message existant via `PATCH` (constate en conditions reelles). `null` pour les
+  /// fichiers non-image (jamais affiches en embed, juste listes par leur nom).
+  discordUrl    String?
   createdAt     DateTime @default(now())
 
   application RecruitmentApplication @relation(fields: [applicationId], references: [id], onDelete: Cascade)
@@ -568,9 +577,6 @@ model MonitoringSafe {
   id          String  @id @default(cuid())
   guildId     String
   positionKey String
-  /// Libelle optionnel donne par le staff pour retrouver facilement un coffre dans `/stock`
-  /// (sinon affiche par sa position brute).
-  label       String?
 
   guildConfig GuildConfig              @relation(fields: [guildId], references: [guildId])
   movements   MonitoringSafeMovement[]

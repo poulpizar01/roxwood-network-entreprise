@@ -41,11 +41,6 @@ export async function recordSafeMovement(
   });
 }
 
-/** Liste les coffres connus d'une guilde. */
-export async function listSafes(guildId: string) {
-  return prisma.monitoringSafe.findMany({ where: { guildId }, orderBy: { positionKey: "asc" } });
-}
-
 /**
  * Stock courant d'un seul item dans un coffre, juste apres un mouvement — utilise pour
  * enrichir le webhook sortant `monitoring.storage` d'un niveau de stock plutot que du seul
@@ -57,27 +52,4 @@ export async function getItemStock(safeId: string, itemId: string): Promise<numb
     _sum: { quantity: true },
   });
   return result._sum.quantity ?? 0;
-}
-
-/** Stock courant (par item) d'un coffre precis. */
-export async function getStockForSafe(safeId: string): Promise<{ itemId: string; quantity: number }[]> {
-  const rows = await prisma.monitoringSafeMovement.groupBy({
-    by: ["itemId"],
-    where: { safeId },
-    _sum: { quantity: true },
-  });
-  return rows.map((r) => ({ itemId: r.itemId, quantity: r._sum.quantity ?? 0 })).filter((r) => r.quantity !== 0);
-}
-
-/** Stock courant (par item), tous coffres de la guilde confondus. */
-export async function getTotalStock(guildId: string): Promise<{ itemId: string; quantity: number }[]> {
-  const safes = await listSafes(guildId);
-  if (safes.length === 0) return [];
-
-  const rows = await prisma.monitoringSafeMovement.groupBy({
-    by: ["itemId"],
-    where: { safeId: { in: safes.map((s) => s.id) } },
-    _sum: { quantity: true },
-  });
-  return rows.map((r) => ({ itemId: r.itemId, quantity: r._sum.quantity ?? 0 })).filter((r) => r.quantity !== 0);
 }

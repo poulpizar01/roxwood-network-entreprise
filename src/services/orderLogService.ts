@@ -9,7 +9,7 @@ import {
   setInvoiceNumber,
 } from "./orderService.js";
 import { getTicketById } from "./ticketService.js";
-import { getGuildConfig } from "./guildConfigService.js";
+import { getGuildConfig, getShopBanner } from "./guildConfigService.js";
 import { dispatchWebhook } from "./webhookDispatcher.js";
 import { logger } from "../utils/logger.js";
 import { buildImageAttachment } from "../utils/imageAttachment.js";
@@ -151,12 +151,6 @@ export async function upsertOrderMessage(client: Client, ticketId: string): Prom
 }
 
 /**
- * Alias de `upsertOrderMessage` utilise apres un changement qui ne touche pas aux lignes
- * de la commande (statut, paiement...), pour un nom explicite au point d'appel.
- */
-export const refreshOrderMessage = upsertOrderMessage;
-
-/**
  * Envoie l'etat complet et courant d'une commande sur l'unique evenement `order.updated` —
  * meme raisonnement que `absenceService.dispatchAbsenceUpdated` : un recepteur qui veut
  * generer sa propre facture n'a qu'un type d'evenement a ecouter pour toujours avoir la
@@ -253,8 +247,9 @@ async function buildInvoiceEmbed(
   if (footerLines.length > 0) embed.setFooter({ text: footerLines.join("\n") });
 
   const files: AttachmentBuilder[] = [];
-  if (config?.shopBannerData && config.shopBannerFilename) {
-    const { attachment, url } = buildImageAttachment(Buffer.from(config.shopBannerData), config.shopBannerFilename);
+  const banner = await getShopBanner(guildId);
+  if (banner) {
+    const { attachment, url } = buildImageAttachment(banner.shopBannerData, banner.shopBannerFilename);
     embed.setImage(url);
     files.push(attachment);
   }

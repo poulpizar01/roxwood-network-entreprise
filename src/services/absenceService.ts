@@ -77,9 +77,21 @@ export async function saveAbsenceMessageRef(id: string, messageId: string) {
   return prisma.absenceRequest.update({ where: { id }, data: { messageId } });
 }
 
-/** Accepte ou refuse une demande d'absence encore en attente. */
+/**
+ * Accepte ou refuse une demande d'absence encore en attente. `updateMany` avec `status:
+ * "PENDING"` dans le `where` (pas un `findUnique` + `update` separes) rend l'operation
+ * atomique : si deux membres du staff cliquent Accepter/Refuser sur la meme demande presque
+ * simultanement, un seul appel trouve effectivement une ligne PENDING a modifier — l'autre
+ * recoit `null` et sait qu'il est arrive trop tard, sans ecraser la decision du premier.
+ */
 export async function resolveAbsenceRequest(id: string, resolverId: string, status: AbsenceStatus) {
-  const request = await prisma.absenceRequest.update({ where: { id }, data: { status, resolverId, resolvedAt: new Date() } });
+  const { count } = await prisma.absenceRequest.updateMany({
+    where: { id, status: "PENDING" },
+    data: { status, resolverId, resolvedAt: new Date() },
+  });
+  if (count === 0) return null;
+
+  const request = await prisma.absenceRequest.findUniqueOrThrow({ where: { id } });
   await dispatchAbsenceUpdated(request);
   return request;
 }

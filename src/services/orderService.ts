@@ -34,7 +34,7 @@ export async function getOrCreateOrder(ticketId: string) {
  */
 export async function addItemFromAnswers(
   orderId: string,
-  catalogItem: CatalogItem,
+  catalogItem: Omit<CatalogItem, "imageData">,
   answers: { field: CatalogItemField; value: string }[]
 ) {
   const quantityAnswer = answers.find((a) => a.field.style === "QUANTITY");
@@ -119,13 +119,6 @@ export async function setDiscountPercent(orderId: string, discountPercent: numbe
   return prisma.serviceOrder.update({ where: { id: orderId }, data: { discountPercent } });
 }
 
-/** Recupere une commande par son id, avec ses lignes et les reponses de chacune. */
-export async function getOrderWithItems(orderId: string) {
-  return prisma.serviceOrder.findUnique({
-    where: { id: orderId },
-    include: { items: { include: { answers: true } } },
-  });
-}
 
 /** Recupere la commande d'un ticket par son id de ticket, avec ses lignes et reponses. */
 export async function getOrderByTicket(ticketId: string) {

@@ -225,7 +225,7 @@ export async function buildServicePanelEmbed(guildId: string): Promise<EmbedBuil
         .map((item) => {
           const fields = item.fields.length ? item.fields.map((f) => f.label).join(", ") : "aucun";
           const weight = item.weightGrams !== null ? `${(item.weightGrams / 1000).toFixed(1)}kg` : "non renseigné";
-          return `**${item.name}** — ${item.price.toLocaleString("fr-FR")} $ (photo : ${item.imageData ? "oui" : "non"}, poids : ${weight})\nChamps : ${fields}`;
+          return `**${item.name}** — ${item.price.toLocaleString("fr-FR")} $ (photo : ${item.imageFilename ? "oui" : "non"}, poids : ${weight})\nChamps : ${fields}`;
         })
         .join("\n\n"),
     });
@@ -238,7 +238,7 @@ export async function buildServicePanelEmbed(guildId: string): Promise<EmbedBuil
       `Téléphone : ${config?.shopPhone ?? "non configuré"}`,
       `Message de remerciement : ${config?.shopThankYouMessage ?? "non configuré"}`,
       `Capacité d'un camion : ${config?.truckCapacityGrams ? `${(config.truckCapacityGrams / 1000).toFixed(1)}kg` : "non configurée"}`,
-      `Bannière : ${config?.shopBannerData ? "configurée" : "non configurée"}`,
+      `Bannière : ${config?.shopBannerFilename ? "configurée" : "non configurée"}`,
     ].join("\n"),
   });
 
@@ -492,7 +492,7 @@ export async function refreshServicePanelMessage(client: Client, guildId: string
   const categoryId = config?.ticketCategories.find((c) => c.type === "SERVICE")?.categoryId ?? null;
   await upsertPanelMessage(client, guildId, "SERVICE", channelId, {
     embeds: [await buildServicePanelEmbed(guildId)],
-    components: buildServicePanelRows(categoryId, Boolean(config?.shopBannerData)),
+    components: buildServicePanelRows(categoryId, Boolean(config?.shopBannerFilename)),
   });
 }
 
@@ -563,7 +563,7 @@ export async function refreshAllPanelMessages(client: Client, guildId: string): 
 
 /** Rafraichit le panneau de toutes les guildes ayant un salon panneau configure — appelee une seule fois au demarrage du bot. */
 export async function refreshAllPanelsAcrossGuilds(client: Client): Promise<void> {
-  const configs = await prisma.guildConfig.findMany({ where: { panelChannelId: { not: null } } });
+  const configs = await prisma.guildConfig.findMany({ where: { panelChannelId: { not: null } }, select: { guildId: true } });
   for (const config of configs) {
     await refreshAllPanelMessages(client, config.guildId);
   }

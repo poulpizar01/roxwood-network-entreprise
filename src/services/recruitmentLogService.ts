@@ -1,5 +1,5 @@
 import { ActionRowBuilder, AttachmentBuilder, ButtonBuilder, ButtonStyle, EmbedBuilder, type Client } from "discord.js";
-import { getApplication } from "./recruitmentService.js";
+import { addAttachments, getApplication, getApplicationSummary, saveLogMessageRef, setAttachmentDiscordUrls } from "./recruitmentService.js";
 import { getTicketById } from "./ticketService.js";
 import { getGuildConfig, setRecruitmentStatusMessageId } from "./guildConfigService.js";
 import { prisma } from "../db/prisma.js";
@@ -10,9 +10,21 @@ import { logger } from "../utils/logger.js";
  * Construction et mise a jour du message de suivi d'une candidature (recap + boutons
  * Statut/S'assigner). Regroupe ici plutot que dans `interactionCreate.ts` car ce message
  * doit pouvoir etre rafraichi depuis deux endroits distincts : un clic sur bouton/menu
- * (`ButtonInteraction`/`StringSelectMenuInteraction`) et un message classique du candidat
- * contenant une piece jointe (`Message`, voir `messageCreate.ts`) — les deux exposent un
- * `.client` (`Client`) mais pas le meme type d'objet Discord.js.
+ * (`ButtonInteraction`/`StringSelectMenuInteraction`) et l'auto-acceptation par le monitoring
+ * RECRUITMENT (`Client` seul, pas d'interaction).
+ *
+ * Les pieces jointes du candidat ne sont chargees et affichees qu'une seule fois, au moment ou
+ * il clique "J'ai terminé d'envoyer mes fichiers" (voir `finalizeRecruitmentAttachments`) —
+ * jamais de facon incrementale a chaque fichier recu. Ce choix n'est pas qu'une question
+ * d'efficacite : verifie en conditions reelles, Discord ne persiste pas de facon fiable
+ * l'image d'un embed nouvellement ajoute a un message existant via `PATCH` (meme quand la
+ * reponse de l'appel l'affichait correctement juste apres l'edition, une relecture immediate
+ * du message ne la montrait plus). Une image ajoutee en une seule fois via `POST` (nouveau
+ * message) fonctionne de facon fiable — d'ou le choix de tout charger en un seul envoi plutot
+ * que d'editer le message au fur et a mesure. Une fois les URLs Discord capturees (voir
+ * `RecruitmentAttachment.discordUrl`), les rafraichissements suivants (changement de statut,
+ * assignation) sont de simples editions de texte qui reutilisent ces URLs deja resolues, sans
+ * plus jamais toucher aux pieces jointes du message.
  */
 
 /** Etapes du pipeline de recrutement proposees dans le menu deroulant "Statut". */
@@ -29,17 +41,13 @@ export function recruitmentStatusLabel(status: string): string {
 }
 
 /**
- * Construit l'embed de suivi d'une candidature (candidat, salon, statut, recruteur,
- * reponses au formulaire, pieces jointes) et les fichiers Discord a joindre au meme message
- * pour que les references `attachment://` de l'embed resolvent. Reutilise a la fois pour le
- * premier envoi et pour la mise a jour du message apres un changement de
- * statut/assignation/piece jointe.
- *
- * Les octets de chaque piece jointe (voir `RecruitmentAttachment.data`) sont re-uploades a
- * chaque appel plutot que reutiliser une URL Discord anterieure — meme raisonnement que
- * `buildImageAttachment` : decouple l'affichage de la duree de vie d'un message anterieur.
- * Chaque nom de fichier est prefixe par son index pour rester unique au sein du message, meme
- * si deux pieces jointes partagent le meme nom d'origine (ex: deux "photo.jpg").
+ * Construit l'embed principal de suivi d'une candidature (candidat, salon, statut, recruteur,
+ * reponses au formulaire, liste des pieces jointes) ainsi qu'un embed image supplementaire par
+ * piece jointe image deja resolue (`discordUrl` non nul — voir `finalizeRecruitmentAttachments`).
+ * Ne touche jamais aux octets ni aux pieces jointes du message : uniquement du texte et des
+ * URLs Discord deja connues, donc toujours sur d'etre applique par une simple edition. Reutilise
+ * a la fois pour le premier envoi (texte seul, aucune piece jointe encore) et pour la mise a
+ * jour du message apres un changement de statut/assignation.
  */
 export function buildRecruitmentEmbed(
   ticket: { channelId: string; openerId: string | null },
@@ -47,9 +55,9 @@ export function buildRecruitmentEmbed(
     status: string;
     recruiterId: string | null;
     answers: { question: string; answer: string }[];
-    attachments: { data: Uint8Array; filename: string }[];
+    attachments: { filename: string; discordUrl: string | null }[];
   }
-): { embed: EmbedBuilder; files: AttachmentBuilder[] } {
+): EmbedBuilder[] {
   const embed = new EmbedBuilder()
     .setTitle("Candidature")
     .setColor(0x5865f2)
@@ -61,25 +69,19 @@ export function buildRecruitmentEmbed(
       ...application.answers.map((a) => ({ name: a.question, value: a.answer || "-" }))
     );
 
-  const files: AttachmentBuilder[] = [];
+  const imageEmbeds: EmbedBuilder[] = [];
   if (application.attachments.length > 0) {
     embed.addFields({
       name: "Pièces jointes",
       value: application.attachments.map((a, i) => a.filename || `Fichier ${i + 1}`).join("\n"),
     });
 
-    let firstImageUrl: string | null = null;
-    application.attachments.forEach((a, i) => {
-      const uniqueName = `${i}-${a.filename || "fichier"}`;
-      const { attachment, url } = buildImageAttachment(Buffer.from(a.data), uniqueName);
-      files.push(attachment);
-      if (!firstImageUrl && /\.(png|jpe?g|gif|webp)$/i.test(a.filename)) firstImageUrl = url;
-    });
-    // Un embed n'affiche qu'une seule image en grand : on prend la 1ere piece jointe qui en est une.
-    if (firstImageUrl) embed.setImage(firstImageUrl);
+    for (const a of application.attachments) {
+      if (a.discordUrl) imageEmbeds.push(new EmbedBuilder().setTitle(a.filename).setColor(0x5865f2).setImage(a.discordUrl));
+    }
   }
 
-  return { embed, files };
+  return [embed, ...imageEmbeds];
 }
 
 /** Boutons "Statut" et "S'assigner" affiches sous le message de suivi d'une candidature. */
@@ -120,27 +122,114 @@ export async function resolveRecruitmentLogChannel(client: Client, guildId: stri
 
 /**
  * Recharge le ticket/la candidature depuis la base et met a jour en place le message de
- * suivi (embed + boutons), apres un changement de statut, d'assignation, ou l'ajout d'une
- * piece jointe. No-op silencieux si le message de suivi n'a jamais ete envoye (candidature
- * pas encore soumise) ou n'est plus accessible (salon/message supprime) — journalise mais
- * ne fait pas echouer l'action qui a declenche la mise a jour.
+ * suivi (embed + boutons), apres un changement de statut ou d'assignation — jamais pour une
+ * piece jointe, voir `finalizeRecruitmentAttachments` pour ce cas. No-op silencieux si le
+ * message de suivi n'a jamais ete envoye (candidature pas encore soumise) ou n'est plus
+ * accessible (salon/message supprime) — journalise mais ne fait pas echouer l'action qui a
+ * declenche la mise a jour.
  */
 export async function refreshRecruitmentLogMessage(client: Client, ticketId: string): Promise<void> {
   const ticket = await getTicketById(ticketId);
-  const application = await getApplication(ticketId);
+  const application = await getApplicationSummary(ticketId);
   if (!ticket || !application || !application.logChannelId || !application.logMessageId) return;
 
   try {
     const channel = await client.channels.fetch(application.logChannelId);
     if (!channel?.isTextBased() || channel.isDMBased()) return;
     const message = await channel.messages.fetch(application.logMessageId);
-    const { embed, files } = buildRecruitmentEmbed(ticket, application);
-    // `attachments: []` efface les pieces jointes precedentes du message avant d'ajouter
-    // `files` : sans ca, discord.js conserve les anciennes en plus des nouvelles a chaque
-    // edition, et le nombre de fichiers doublerait a chaque nouvelle piece jointe candidat.
-    await message.edit({ embeds: [embed], files, attachments: [], components: [buildRecruitmentActionRow(ticketId)] });
+    const embeds = buildRecruitmentEmbed(ticket, application);
+    await message.edit({ embeds, components: [buildRecruitmentActionRow(ticketId)] });
   } catch (error) {
     logger.error(`Echec de mise a jour du message de suivi pour le ticket ${ticketId}`, error);
+  }
+}
+
+/**
+ * Charge et affiche, en une seule fois, les pieces jointes que le candidat a envoyees dans le
+ * salon du ticket — declenchee par le bouton "J'ai terminé d'envoyer mes fichiers" (voir
+ * `handleRecruitmentFinishAttachments` dans `interactionCreate.ts`). `files` : octets deja
+ * telecharges par l'appelant depuis les URL CDN Discord des messages du candidat.
+ *
+ * Puisqu'une image ne peut pas etre ajoutee de facon fiable a un message existant par edition
+ * (voir le commentaire en tete de fichier), le message de suivi existant (texte seul, envoye a
+ * la soumission du formulaire) est supprime puis reposte integralement avec les images cette
+ * fois — en un seul `POST`, la seule methode fiable constatee. Les URLs Discord finales de
+ * chaque image sont ensuite capturees et stockees, pour que tous les rafraichissements
+ * ulterieurs (`refreshRecruitmentLogMessage`) restent de simples editions de texte.
+ */
+export async function finalizeRecruitmentAttachments(
+  client: Client,
+  ticketId: string,
+  files: { data: Buffer; filename: string }[]
+): Promise<void> {
+  await addAttachments(ticketId, files);
+
+  const ticket = await getTicketById(ticketId);
+  const application = await getApplication(ticketId);
+  if (!ticket || !application) return;
+
+  const channel = application.logChannelId
+    ? await client.channels.fetch(application.logChannelId).catch(() => null)
+    : await resolveRecruitmentLogChannel(client, ticket.guildId, ticket.channelId).catch(() => null);
+  if (!channel?.isTextBased() || channel.isDMBased()) return;
+
+  // Le texte est identique a `buildRecruitmentEmbed`, mais ici les images sont fraichement
+  // uploadees (`attachment://`) puisque c'est le tout premier — et unique — envoi qui les
+  // introduit, plutot que reutilisees via une URL deja connue (il n'y en a pas encore).
+  const infoEmbed = new EmbedBuilder()
+    .setTitle("Candidature")
+    .setColor(0x5865f2)
+    .addFields(
+      { name: "Candidat", value: ticket.openerId ? `<@${ticket.openerId}>` : "inconnu", inline: true },
+      { name: "Ticket", value: `<#${ticket.channelId}>`, inline: true },
+      { name: "Statut", value: `**${recruitmentStatusLabel(application.status)}**`, inline: true },
+      { name: "Recruteur", value: application.recruiterId ? `<@${application.recruiterId}>` : "non assigné", inline: true },
+      ...application.answers.map((a) => ({ name: a.question, value: a.answer || "-" }))
+    );
+
+  const uploadFiles: AttachmentBuilder[] = [];
+  const imageEmbeds: EmbedBuilder[] = [];
+  // On associe chaque piece jointe image a son embed dans le meme ordre, pour retrouver apres
+  // coup quelle URL Discord finale correspond a quelle ligne `RecruitmentAttachment`.
+  const imageAttachmentIds: string[] = [];
+
+  if (application.attachments.length > 0) {
+    infoEmbed.addFields({
+      name: "Pièces jointes",
+      value: application.attachments.map((a, i) => a.filename || `Fichier ${i + 1}`).join("\n"),
+    });
+
+    application.attachments.forEach((a, i) => {
+      if (!/\.(png|jpe?g|gif|webp)$/i.test(a.filename)) return;
+      const uniqueName = `${i}-${a.filename || "fichier"}`;
+      const built = buildImageAttachment(Buffer.from(a.data), uniqueName);
+      uploadFiles.push(built.attachment);
+      imageEmbeds.push(new EmbedBuilder().setTitle(a.filename).setColor(0x5865f2).setImage(built.url));
+      imageAttachmentIds.push(a.id);
+    });
+  }
+
+  if (application.logMessageId) {
+    const oldMessage = await channel.messages.fetch(application.logMessageId).catch(() => null);
+    if (oldMessage) await oldMessage.delete().catch((error) => logger.warn(`Echec suppression de l'ancien message de suivi pour le ticket ${ticketId}`, error));
+  }
+
+  const newMessage = await channel.send({
+    embeds: [infoEmbed, ...imageEmbeds],
+    files: uploadFiles,
+    components: [buildRecruitmentActionRow(ticketId)],
+  });
+  await saveLogMessageRef(ticketId, channel.id, newMessage.id);
+
+  if (imageAttachmentIds.length > 0) {
+    const resolvedImageEmbeds = newMessage.embeds.filter((e) => e.image);
+    const urls = imageAttachmentIds
+      .map((attachmentId, i) => {
+        const url = resolvedImageEmbeds[i]?.image?.url;
+        return url ? { attachmentId, discordUrl: url } : null;
+      })
+      .filter((u): u is { attachmentId: string; discordUrl: string } => u !== null);
+    await setAttachmentDiscordUrls(urls);
   }
 }
 
@@ -226,7 +315,7 @@ export async function refreshRecruitmentStatusMessage(client: Client, guildId: s
  * ainsi automatiquement sans reconfiguration manuelle.
  */
 export async function refreshAllRecruitmentStatusMessages(client: Client): Promise<void> {
-  const configs = await prisma.guildConfig.findMany({ where: { recruitmentStatusChannelId: { not: null } } });
+  const configs = await prisma.guildConfig.findMany({ where: { recruitmentStatusChannelId: { not: null } }, select: { guildId: true } });
   for (const config of configs) {
     await refreshRecruitmentStatusMessage(client, config.guildId);
   }

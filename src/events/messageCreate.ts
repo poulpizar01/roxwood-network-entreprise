@@ -1,8 +1,6 @@
 import type { Message } from "discord.js";
 import { getGuildConfig, isTicketManager } from "../services/guildConfigService.js";
 import { getTicketByChannel, recordFirstStaffReply } from "../services/ticketService.js";
-import { addAttachment } from "../services/recruitmentService.js";
-import { refreshRecruitmentLogMessage } from "../services/recruitmentLogService.js";
 import { ingestMonitoringMessage } from "../services/monitoringService.js";
 import { logger } from "../utils/logger.js";
 
@@ -19,9 +17,13 @@ import { logger } from "../utils/logger.js";
  *    ou un menu (typiquement le bouton "Close" de Ticket Tool) : impossible de simuler un
  *    clic sur un composant d'un autre bot (Discord ne le permet pas), donc ce bouton reste
  *    le seul moyen reel de fermer un ticket cote Ticket Tool et doit rester accessible au staff ;
- * 2. detecter la premiere reponse d'un membre du staff ;
- * 3. sur un ticket de recrutement, rattacher les pieces jointes envoyees par le candidat
- *    a sa candidature (les modals Discord ne supportent pas l'upload de fichier).
+ * 2. detecter la premiere reponse d'un membre du staff.
+ *
+ * Les pieces jointes d'une candidature de recrutement ne sont plus traitees ici au fil des
+ * messages : le candidat clique "J'ai terminé d'envoyer mes fichiers" une fois ses fichiers
+ * envoyes, ce qui declenche un chargement en une seule fois (voir `handleRecruitmentFinishAttachments`
+ * dans `interactionCreate.ts` et `finalizeRecruitmentAttachments` dans `recruitmentLogService.ts`).
+ *
  * Ignore les messages hors guilde (DMs).
  */
 export async function onMessageCreate(message: Message): Promise<void> {
@@ -47,26 +49,5 @@ export async function onMessageCreate(message: Message): Promise<void> {
 
   if (authorIsStaff) {
     await recordFirstStaffReply(message.channelId);
-    return;
-  }
-
-  // Seule la piece jointe du client declenche le rattachement (pas n'importe quel visiteur
-  // du salon) ; si l'opener n'a pas pu etre determine, on laisse passer par prudence.
-  if (ticket.openerId && message.author.id !== ticket.openerId) return;
-
-  if (ticket.type === "RECRUITMENT" && message.attachments.size > 0) {
-    try {
-      for (const attachment of message.attachments.values()) {
-        // On telecharge les octets pour les posseder (voir `RecruitmentAttachment.data`)
-        // plutot que de garder l'URL CDN Discord de l'attachment, qui est signee et expire —
-        // meme raisonnement que pour les photos de catalogue et la banniere de facture.
-        const response = await fetch(attachment.url);
-        const data = Buffer.from(await response.arrayBuffer());
-        await addAttachment(ticket.id, data, attachment.name ?? "fichier");
-      }
-      await refreshRecruitmentLogMessage(message.client, ticket.id);
-    } catch (error) {
-      logger.error(`Erreur enregistrement piece jointe pour le ticket ${ticket.id}`, error);
-    }
   }
 }

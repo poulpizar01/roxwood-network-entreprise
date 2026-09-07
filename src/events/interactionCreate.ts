@@ -13,16 +13,26 @@ import {
   TextInputStyle,
   type ButtonInteraction,
   type Interaction,
+  type Message,
   type StringSelectMenuInteraction,
+  type TextBasedChannel,
 } from "discord.js";
 import { commandsByName } from "../commands/index.js";
 import { getTicketByChannel, getTicketById, markTicketClosed } from "../services/ticketService.js";
-import { assignRecruiter, saveAnswers, saveLogMessageRef, setStatus as setApplicationStatus } from "../services/recruitmentService.js";
+import {
+  MAX_RECRUITMENT_ATTACHMENTS,
+  assignRecruiter,
+  getApplicationSummary,
+  saveAnswers,
+  saveLogMessageRef,
+  setStatus as setApplicationStatus,
+} from "../services/recruitmentService.js";
 import {
   RECRUITMENT_STATUS_CHOICES,
   applyRecruitmentAcceptance,
   buildRecruitmentActionRow,
   buildRecruitmentEmbed,
+  finalizeRecruitmentAttachments,
   recruitmentStatusLabel,
   refreshRecruitmentLogMessage,
   refreshRecruitmentStatusMessage,
@@ -33,6 +43,7 @@ import {
   addItem,
   buildCatalogSelectOptions,
   getItem,
+  getItemWithImage,
   listActive,
   listActiveWithFields,
   removeField,
@@ -107,16 +118,18 @@ import { createSubscription, listCustomSubscriptions, listSubscriptions, removeS
 import { createSheetSync, listSheetSyncs, removeSheetSync } from "../services/sheetSyncService.js";
 import type { MonitoringLogType } from "@prisma/client";
 import { logger } from "../utils/logger.js";
-import { buildImageAttachment } from "../utils/imageAttachment.js";
+import { buildImageAttachment, FETCH_TIMEOUT_MS, MAX_UPLOAD_SIZE_BYTES } from "../utils/imageAttachment.js";
 
 /**
  * Point d'entree unique pour toutes les interactions Discord (commandes slash, boutons,
  * menus deroulants, soumissions de modal). Route chaque interaction vers son handler dedie
  * en fonction de son type et de son `customId`. C'est ici que vivent les trois flux
  * conversationnels a plusieurs etapes du bot :
- * - Recrutement : bouton "recruitment:start-form" -> modal -> "recruitment:submit-form",
- *   puis pilotage staff par boutons "recruitment:assign:<ticketId>" / "recruitment:status:<ticketId>"
- *   -> menu "recruitment:set-status:<ticketId>"
+ * - Recrutement : bouton "recruitment:start-form" -> modal -> "recruitment:submit-form"
+ *   -> bouton candidat "recruitment:finish-attachments:<ticketId>" (charge les pieces jointes
+ *   envoyees entre-temps, une seule fois), puis pilotage staff par boutons
+ *   "recruitment:assign:<ticketId>" / "recruitment:status:<ticketId>" -> menu
+ *   "recruitment:set-status:<ticketId>"
  * - Commande self-service : select "order:select-item" -> modal dynamique ->
  *   "order:submit-item:<catalogItemId>" -> boutons "order:add-more" / "order:confirm", puis
  *   pilotage staff par boutons "order:status:<ticketId>" / "order:mark-paid:<ticketId>" /
@@ -194,7 +207,16 @@ async function handleChatInputCommand(interaction: Interaction): Promise<void> {
  * par defaut si aucune n'est configuree — voir `getEffectiveQuestions`.
  */
 async function handleRecruitmentStartForm(interaction: Interaction): Promise<void> {
-  if (!interaction.isButton() || !interaction.guildId) return;
+  if (!interaction.isButton() || !interaction.guildId || !interaction.channelId) return;
+
+  const ticket = await getTicketByChannel(interaction.channelId);
+  if (ticket) {
+    const application = await getApplicationSummary(ticket.id);
+    if (application?.submittedAt) {
+      await interaction.reply({ content: "Vous avez déjà soumis votre candidature.", ephemeral: true });
+      return;
+    }
+  }
 
   const questions = await getEffectiveQuestions(interaction.guildId);
   const modal = new ModalBuilder().setCustomId("recruitment:submit-form").setTitle("Formulaire de candidature");
@@ -213,16 +235,24 @@ async function handleRecruitmentStartForm(interaction: Interaction): Promise<voi
 
 /**
  * Soumission du formulaire de candidature : enregistre les reponses, puis poste le recap
- * complet (avec les boutons "Statut"/"S'assigner") dans le salon de suivi dedie a la guilde
- * si configure, sinon dans le salon du ticket lui-meme. Le candidat recoit une confirmation
- * qui l'invite aussi a envoyer d'eventuelles pieces jointes directement en message dans le
- * salon (les modals Discord ne supportent pas l'upload de fichier).
+ * (texte seul, sans piece jointe pour l'instant) avec les boutons "Statut"/"S'assigner" dans
+ * le salon de suivi dedie a la guilde si configure, sinon dans le salon du ticket lui-meme. Le
+ * candidat recoit une confirmation avec un bouton "J'ai terminé d'envoyer mes fichiers" : les
+ * modals Discord ne supportant pas l'upload de fichier, il peut envoyer d'eventuelles pieces
+ * jointes directement en message dans le salon puis cliquer ce bouton une fois termine (voir
+ * `handleRecruitmentFinishAttachments`) — c'est ce clic, et lui seul, qui charge les fichiers
+ * sur la candidature, en une seule fois.
  *
  * Relit les questions "effectives" au moment de la soumission (pas de correlation stockee
  * avec celles affichees a l'ouverture du modal) : dans le cas rare ou le staff modifie le
  * formulaire pendant qu'un candidat le remplit, les libelles enregistres peuvent differer de
  * ceux vus par le candidat — compromis accepte, coherent avec le reste du code (pas d'etat de
  * session par interaction).
+ *
+ * Rejette toute resoumission (`submittedAt` deja renseigne) : sans ce garde-fou, un double-clic
+ * sur "Remplir le formulaire" (jamais desactive apres usage) dupliquerait les reponses dans le
+ * recap et ecraserait `logChannelId`/`logMessageId` avec un nouveau message, laissant l'ancien
+ * orphelin (plus jamais mis a jour par les changements de statut/assignation suivants).
  */
 async function handleRecruitmentSubmitForm(interaction: Interaction): Promise<void> {
   if (!interaction.isModalSubmit() || !interaction.channelId || !interaction.guildId) return;
@@ -230,6 +260,12 @@ async function handleRecruitmentSubmitForm(interaction: Interaction): Promise<vo
   const ticket = await getTicketByChannel(interaction.channelId);
   if (!ticket || ticket.type !== "RECRUITMENT") {
     await interaction.reply({ content: "Ce salon n'est pas rattaché à une candidature.", ephemeral: true });
+    return;
+  }
+
+  const existing = await getApplicationSummary(ticket.id);
+  if (existing?.submittedAt) {
+    await interaction.reply({ content: "Vous avez déjà soumis votre candidature.", ephemeral: true });
     return;
   }
 
@@ -243,19 +279,127 @@ async function handleRecruitmentSubmitForm(interaction: Interaction): Promise<vo
 
   const logChannel = await resolveRecruitmentLogChannel(interaction.client, interaction.guildId, ticket.channelId);
   if (logChannel) {
-    const { embed, files } = buildRecruitmentEmbed(ticket, application);
+    const embeds = buildRecruitmentEmbed(ticket, application);
     const message = await logChannel.send({
-      embeds: [embed],
-      files,
+      embeds,
       components: [buildRecruitmentActionRow(ticket.id)],
     });
     await saveLogMessageRef(ticket.id, logChannel.id, message.id);
   }
 
-  await interaction.reply(
-    "Formulaire envoyé, merci ! Notre équipe va examiner votre candidature. " +
-      "Vous pouvez aussi envoyer des photos ou documents directement dans ce salon si besoin."
+  const finishButton = new ButtonBuilder()
+    .setCustomId(`recruitment:finish-attachments:${ticket.id}`)
+    .setLabel("J'ai terminé d'envoyer mes fichiers")
+    .setStyle(ButtonStyle.Primary);
+  await interaction.reply({
+    content:
+      "Formulaire envoyé, merci ! Notre équipe va examiner votre candidature. " +
+      "Vous pouvez envoyer des photos ou documents directement dans ce salon si besoin, puis cliquer sur le bouton ci-dessous une fois terminé.",
+    components: [new ActionRowBuilder<ButtonBuilder>().addComponents(finishButton)],
+  });
+}
+
+/** Nombre max de messages parcourus par `fetchMessagesSince` — garde-fou, aucun ticket normal n'en approche. */
+const MAX_HISTORY_SCAN_MESSAGES = 500;
+
+/**
+ * Recupere tous les messages d'un salon poste apres `sinceTimestamp` (epoch ms), en paginant
+ * en arriere par lots de 100 plutot qu'une seule page limitee — voir `handleRecruitmentFinishAttachments`,
+ * ou une limite fixe de 50 pouvait faire disparaitre silencieusement des pieces jointes du
+ * candidat si le salon avait ete actif entre-temps (staff, autres bots...).
+ */
+async function fetchMessagesSince(channel: TextBasedChannel, sinceTimestamp: number): Promise<Message[]> {
+  const collected: Message[] = [];
+  let before: string | undefined;
+
+  while (collected.length < MAX_HISTORY_SCAN_MESSAGES) {
+    const batch = await channel.messages.fetch({ limit: 100, before });
+    if (batch.size === 0) break;
+
+    const batchMessages = [...batch.values()];
+    collected.push(...batchMessages);
+
+    const oldest = batchMessages[batchMessages.length - 1];
+    if (oldest.createdTimestamp <= sinceTimestamp) break;
+    before = oldest.id;
+  }
+
+  return collected.filter((m) => m.createdTimestamp >= sinceTimestamp);
+}
+
+/**
+ * Clic sur "J'ai terminé d'envoyer mes fichiers" : recupere tous les fichiers envoyes par le
+ * candidat dans le salon depuis la soumission du formulaire, les telecharge/stocke en une
+ * seule fois (voir `finalizeRecruitmentAttachments`), et affiche le resultat au candidat.
+ * Reserve au candidat lui-meme (`ticket.openerId`) — un clic par quelqu'un d'autre est ignore
+ * silencieusement plutot que de traiter les fichiers d'une autre personne.
+ *
+ * `deferReply` : parcourir l'historique du salon + telecharger plusieurs fichiers peut
+ * facilement depasser le delai de 3s avant lequel Discord attend une premiere reponse.
+ */
+async function handleRecruitmentFinishAttachments(interaction: Interaction, ticketId: string): Promise<void> {
+  if (!interaction.isButton() || !interaction.channelId) return;
+
+  const ticket = await getTicketById(ticketId);
+  if (!ticket || ticket.type !== "RECRUITMENT") return;
+  if (ticket.openerId && interaction.user.id !== ticket.openerId) {
+    await interaction.reply({ content: "Seul le candidat peut valider ses propres fichiers.", ephemeral: true });
+    return;
+  }
+
+  const application = await getApplicationSummary(ticketId);
+  if (application && application.attachments.length > 0) {
+    await interaction.reply({ content: "Vos fichiers ont déjà été enregistrés.", ephemeral: true });
+    return;
+  }
+
+  await interaction.deferReply({ ephemeral: true });
+
+  const channel = await interaction.client.channels.fetch(interaction.channelId);
+  if (!channel?.isTextBased() || channel.isDMBased()) {
+    await interaction.editReply({ content: "Salon introuvable, réessaie plus tard." });
+    return;
+  }
+
+  // Pagine en arriere jusqu'a la soumission du formulaire plutot qu'une simple limite de 50
+  // messages : un salon avec beaucoup d'echanges (staff, autres bots...) entre la soumission
+  // et le clic sur ce bouton pouvait faire sortir les pieces jointes du candidat de la fenetre,
+  // les faisant disparaitre silencieusement. `maxMessages` reste un garde-fou raisonnable
+  // (aucun ticket normal n'a besoin de plus).
+  const sinceTimestamp = application?.submittedAt?.getTime() ?? 0;
+  const candidateMessages = (await fetchMessagesSince(channel, sinceTimestamp)).filter(
+    (m) => m.author.id === interaction.user.id && m.attachments.size > 0
   );
+
+  const allAttachments = candidateMessages.flatMap((m) => [...m.attachments.values()]);
+
+  const accepted: { data: Buffer; filename: string }[] = [];
+  const rejected: string[] = [];
+  for (const attachment of allAttachments) {
+    const name = attachment.name ?? "fichier";
+    if (accepted.length >= MAX_RECRUITMENT_ATTACHMENTS) {
+      rejected.push(`${name} (limite de ${MAX_RECRUITMENT_ATTACHMENTS} fichiers par candidature atteinte)`);
+      continue;
+    }
+    if (attachment.size > MAX_UPLOAD_SIZE_BYTES) {
+      rejected.push(`${name} (dépasse 8 Mo)`);
+      continue;
+    }
+    try {
+      const response = await fetch(attachment.url, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
+      accepted.push({ data: Buffer.from(await response.arrayBuffer()), filename: name });
+    } catch (error) {
+      logger.warn(`Echec de telechargement de la piece jointe ${name} pour le ticket ${ticketId}`, error);
+      rejected.push(`${name} (échec du téléchargement, réessaie)`);
+    }
+  }
+
+  if (accepted.length > 0) await finalizeRecruitmentAttachments(interaction.client, ticketId, accepted);
+
+  const parts: string[] = [];
+  parts.push(accepted.length > 0 ? `${accepted.length} fichier(s) enregistré(s).` : "Aucun fichier trouvé dans ce salon.");
+  if (rejected.length > 0) parts.push(`Non retenu(s) : ${rejected.join(", ")}.`);
+  await interaction.editReply({ content: parts.join(" ") });
 }
 
 /**
@@ -385,7 +529,7 @@ async function handleOrderSelectItem(interaction: Interaction): Promise<void> {
   if (!interaction.isStringSelectMenu()) return;
 
   const catalogItemId = interaction.values[0];
-  const item = await getItem(interaction.guildId!, catalogItemId);
+  const item = await getItemWithImage(interaction.guildId!, catalogItemId);
   if (!item) {
     await interaction.reply({ content: "Cet article n'existe plus.", ephemeral: true });
     return;
@@ -1025,13 +1169,20 @@ async function handleAbsenceResolve(interaction: Interaction, requestId: string,
     return;
   }
 
+  // Pre-verification rapide pour le cas courant (evite un aller-retour d'ecriture inutile) —
+  // la vraie garantie contre un double traitement simultane vient de la mise a jour
+  // conditionnelle dans `resolveAbsenceRequest` elle-meme (`updateMany` atomique).
   const request = await getAbsenceRequest(requestId);
   if (!request || request.status !== "PENDING") {
     await interaction.reply({ content: "Cette demande a déjà été traitée.", ephemeral: true });
     return;
   }
 
-  await resolveAbsenceRequest(requestId, interaction.user.id, status);
+  const resolved = await resolveAbsenceRequest(requestId, interaction.user.id, status);
+  if (!resolved) {
+    await interaction.reply({ content: "Cette demande a déjà été traitée.", ephemeral: true });
+    return;
+  }
   await refreshAbsenceMessage(interaction.client, requestId);
   await interaction.reply({ content: status === "ACCEPTED" ? "Demande acceptée." : "Demande refusée.", ephemeral: true });
 }
@@ -1184,13 +1335,17 @@ async function handleServiceSetImageSelect(interaction: Interaction): Promise<vo
     await interaction.editReply({ content: "Aucune image reçue à temps, réessaie avec le bouton." });
     return;
   }
+  if (attachment.size > MAX_UPLOAD_SIZE_BYTES) {
+    await interaction.editReply({ content: "Cette image dépasse 8 Mo, réessaie avec un fichier plus léger." });
+    return;
+  }
 
   try {
     // On telecharge les octets pour les posseder (stockes en base, voir `setItemImage`) plutot
     // que de garder l'URL CDN Discord de l'attachment : celle-ci cesse de repondre (404) des
     // que son message est supprime, meme avant l'expiration du lien signe. Les possedant, on
     // peut supprimer ce message tout de suite sans rien casser.
-    const response = await fetch(attachment.url);
+    const response = await fetch(attachment.url, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
     const data = Buffer.from(await response.arrayBuffer());
     await setItemImage(interaction.guildId, itemId, data, attachment.name ?? "photo.png");
     await photoMessage.delete().catch((error: unknown) => logger.warn("Echec suppression du message photo dans le panneau", error));
@@ -1342,11 +1497,15 @@ async function handlePanelServiceSetBanner(interaction: Interaction): Promise<vo
     await interaction.editReply({ content: "Aucune image reçue à temps, réessaie avec le bouton." });
     return;
   }
+  if (attachment.size > MAX_UPLOAD_SIZE_BYTES) {
+    await interaction.editReply({ content: "Cette image dépasse 8 Mo, réessaie avec un fichier plus léger." });
+    return;
+  }
 
   try {
     // Meme raisonnement que la photo d'article : on possede les octets plutot que l'URL CDN,
     // pour pouvoir supprimer ce message sans casser la banniere sur les factures.
-    const response = await fetch(attachment.url);
+    const response = await fetch(attachment.url, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
     const data = Buffer.from(await response.arrayBuffer());
     await setShopBanner(interaction.guildId, data, attachment.name ?? "banniere.png");
     await photoMessage.delete().catch((error: unknown) => logger.warn("Echec suppression du message banniere dans le panneau", error));
@@ -2033,6 +2192,9 @@ export async function onInteractionCreate(interaction: Interaction): Promise<voi
       }
       if (interaction.customId.startsWith("recruitment:status:")) {
         return await handleRecruitmentStatusButton(interaction, interaction.customId.slice("recruitment:status:".length));
+      }
+      if (interaction.customId.startsWith("recruitment:finish-attachments:")) {
+        return await handleRecruitmentFinishAttachments(interaction, interaction.customId.slice("recruitment:finish-attachments:".length));
       }
       if (interaction.customId === "order:add-more") return await handleOrderAddMore(interaction);
       if (interaction.customId.startsWith("order:confirm-item:")) {
