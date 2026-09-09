@@ -57,11 +57,13 @@ model GuildConfig {
   shopRib                       String?
   /// Numero de telephone de la boutique, affiche en pied de facture.
   shopPhone                     String?
-  /// Octets bruts de la banniere affichee en bas de chaque facture — meme raisonnement que
-  /// `CatalogItem.imageData` : stockee en base plutot qu'une URL Discord, pour pouvoir
-  /// supprimer le message d'upload sans casser l'image.
-  shopBannerData                Bytes?
-  /// Nom de fichier associe a `shopBannerData`, requis par l'API Discord pour le re-upload.
+  /// URL publique de la banniere affichee en bas de chaque facture : URL CDN en production
+  /// (`CDN_TOKEN` configure), `null` en dev local — les octets vivent alors uniquement sur
+  /// disque (`data/dev-images/`, voir `localImageStorage.ts`), jamais en base, pour ne jamais
+  /// faire dependre le schema de production d'un besoin propre au dev local.
+  shopBannerUrl                 String?
+  /// Nom de fichier associe a la banniere (mode disque local ou CDN), garde dans les deux cas
+  /// pour l'affichage/le debug ; requis par l'API Discord pour le re-upload en mode disque local.
   shopBannerFilename            String?
   /// Message de remerciement affiche en pied de facture (ex: "X vous remercie pour votre confiance").
   shopThankYouMessage           String?
@@ -267,24 +269,26 @@ model RecruitmentAnswer {
   application RecruitmentApplication @relation(fields: [applicationId], references: [id], onDelete: Cascade)
 }
 
-/// Fichier (image, document) envoye par le candidat directement en message dans le salon
-/// du ticket. Les modals Discord ne supportent pas l'upload de fichier nativement, donc
-/// c'est le seul moyen pour le candidat de joindre des pieces jointes a sa candidature.
+/// Image envoyee par le candidat directement en message dans le salon du ticket. Les modals
+/// Discord ne supportent pas l'upload de fichier nativement, donc c'est le seul moyen pour le
+/// candidat de joindre des images a sa candidature.
 model RecruitmentAttachment {
   id            String   @id @default(cuid())
   applicationId String
-  /// Octets du fichier, telecharges depuis l'URL Discord CDN au moment de la reception puis
-  /// stockes ici — pas de dependance a une URL Discord CDN, qui est signee et expire (et
-  /// cesse de repondre des que le message d'origine est supprime).
-  data          Bytes
+  /// URL publique de l'image : URL CDN en production (`CDN_TOKEN` configure), `null` en dev
+  /// local — les octets vivent alors uniquement sur disque (`data/dev-images/`, cle
+  /// `recruitment-attachments/<id>`, voir `localImageStorage.ts`), jamais en base.
+  imageUrl      String?
   filename      String
   /// URL Discord CDN de l'image telle qu'affichee dans le message de suivi, capturee une seule
-  /// fois juste apres l'envoi initial (voir `finalizeRecruitmentAttachments`) — reutilisee pour
-  /// tout rafraichissement ulterieur du message (changement de statut, assignation) afin de ne
-  /// jamais re-uploader les octets ni introduire une nouvelle reference `attachment://` dans
-  /// une edition : Discord ne persiste pas de facon fiable l'image d'un embed nouvellement
-  /// ajoute a un message existant via `PATCH` (constate en conditions reelles). `null` pour les
-  /// fichiers non-image (jamais affiches en embed, juste listes par leur nom).
+  /// fois juste apres l'envoi initial en mode disque local/dev (voir
+  /// `finalizeRecruitmentAttachments`) — reutilisee pour tout rafraichissement ulterieur du
+  /// message (changement de statut, assignation) afin de ne jamais relire le fichier local ni
+  /// introduire une nouvelle reference `attachment://` dans une edition : Discord ne persiste
+  /// pas de facon fiable l'image d'un embed nouvellement ajoute a un message existant via
+  /// `PATCH` (constate en conditions reelles). Inutile en mode CDN : `imageUrl` est deja une
+  /// URL stable et externe, directement reutilisable dans n'importe quelle edition sans ce
+  /// contournement.
   discordUrl    String?
   createdAt     DateTime @default(now())
 
@@ -333,14 +337,12 @@ model CatalogItem {
   description   String?
   /// Prix unitaire, en devise in-game (entier, pas de sous-unite/centimes).
   price         Int
-  /// Octets bruts de la photo de l'article, stockes en base plutot que juste son URL Discord :
-  /// l'URL CDN d'un attachment cesse de repondre (404) des que le message qui le porte est
-  /// supprime, meme avant l'expiration normale du lien signe (constate en conditions reelles
-  /// cette session). En les possedant, le bot peut re-uploader l'image (`attachment://<filename>`)
-  /// a chaque fois qu'un embed en a besoin, et le message d'upload original peut etre supprime
-  /// sans rien casser.
-  imageData     Bytes?
-  /// Nom de fichier associe a `imageData`, requis par l'API Discord pour le re-upload.
+  /// URL publique de la photo de l'article : URL CDN en production (`CDN_TOKEN` configure),
+  /// `null` en dev local — les octets vivent alors uniquement sur disque
+  /// (`data/dev-images/`, voir `localImageStorage.ts`), jamais en base.
+  imageUrl      String?
+  /// Nom de fichier associe a la photo (mode disque local ou CDN) ; requis par l'API Discord
+  /// pour le re-upload en mode disque local.
   imageFilename String?
   /// Poids unitaire en grammes, optionnel. Si aucun article d'une commande n'a de poids
   /// configure, "poids total"/"camions requis" sont omis de la facture (voir `orderLogService.ts`).
@@ -574,7 +576,7 @@ model MonitoringEvent {
 /// l'action). Assomption a verifier en conditions reelles : le meme coffre physique emet-il
 /// toujours exactement la meme `targetPosition` ?
 model MonitoringSafe {
-  id          String  @id @default(cuid())
+  id          String @id @default(cuid())
   guildId     String
   positionKey String
 

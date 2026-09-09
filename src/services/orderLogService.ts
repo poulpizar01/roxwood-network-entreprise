@@ -12,7 +12,7 @@ import { getTicketById } from "./ticketService.js";
 import { getGuildConfig, getShopBanner } from "./guildConfigService.js";
 import { dispatchWebhook } from "./webhookDispatcher.js";
 import { logger } from "../utils/logger.js";
-import { buildImageAttachment } from "../utils/imageAttachment.js";
+import { resolveImageDisplay } from "../utils/imageAttachment.js";
 
 /**
  * Construction et mise a jour de l'unique message de commande dans le salon du ticket :
@@ -248,10 +248,10 @@ async function buildInvoiceEmbed(
 
   const files: AttachmentBuilder[] = [];
   const banner = await getShopBanner(guildId);
-  if (banner) {
-    const { attachment, url } = buildImageAttachment(banner.shopBannerData, banner.shopBannerFilename);
-    embed.setImage(url);
-    files.push(attachment);
+  const image = banner ? await resolveImageDisplay(banner, `shop-banners/${guildId}`) : null;
+  if (image) {
+    embed.setImage(image.url);
+    if (image.attachment) files.push(image.attachment);
   }
 
   return { embed, files };

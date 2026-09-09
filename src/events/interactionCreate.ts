@@ -43,7 +43,6 @@ import {
   addItem,
   buildCatalogSelectOptions,
   getItem,
-  getItemWithImage,
   listActive,
   listActiveWithFields,
   removeField,
@@ -118,7 +117,7 @@ import { createSubscription, listCustomSubscriptions, listSubscriptions, removeS
 import { createSheetSync, listSheetSyncs, removeSheetSync } from "../services/sheetSyncService.js";
 import type { MonitoringLogType } from "@prisma/client";
 import { logger } from "../utils/logger.js";
-import { buildImageAttachment, FETCH_TIMEOUT_MS, MAX_UPLOAD_SIZE_BYTES } from "../utils/imageAttachment.js";
+import { FETCH_TIMEOUT_MS, isImageAttachment, MAX_UPLOAD_SIZE_BYTES, resolveImageDisplay } from "../utils/imageAttachment.js";
 
 /**
  * Point d'entree unique pour toutes les interactions Discord (commandes slash, boutons,
@@ -294,7 +293,7 @@ async function handleRecruitmentSubmitForm(interaction: Interaction): Promise<vo
   await interaction.reply({
     content:
       "Formulaire envoyé, merci ! Notre équipe va examiner votre candidature. " +
-      "Vous pouvez envoyer des photos ou documents directement dans ce salon si besoin, puis cliquer sur le bouton ci-dessous une fois terminé.",
+      "Vous pouvez envoyer des photos directement dans ce salon si besoin, puis cliquer sur le bouton ci-dessous une fois terminé.",
     components: [new ActionRowBuilder<ButtonBuilder>().addComponents(finishButton)],
   });
 }
@@ -373,12 +372,16 @@ async function handleRecruitmentFinishAttachments(interaction: Interaction, tick
 
   const allAttachments = candidateMessages.flatMap((m) => [...m.attachments.values()]);
 
-  const accepted: { data: Buffer; filename: string }[] = [];
+  const accepted: { data: Buffer; filename: string; contentType?: string | null }[] = [];
   const rejected: string[] = [];
   for (const attachment of allAttachments) {
     const name = attachment.name ?? "fichier";
     if (accepted.length >= MAX_RECRUITMENT_ATTACHMENTS) {
       rejected.push(`${name} (limite de ${MAX_RECRUITMENT_ATTACHMENTS} fichiers par candidature atteinte)`);
+      continue;
+    }
+    if (!isImageAttachment(attachment)) {
+      rejected.push(`${name} (seules les images sont acceptées)`);
       continue;
     }
     if (attachment.size > MAX_UPLOAD_SIZE_BYTES) {
@@ -387,7 +390,7 @@ async function handleRecruitmentFinishAttachments(interaction: Interaction, tick
     }
     try {
       const response = await fetch(attachment.url, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
-      accepted.push({ data: Buffer.from(await response.arrayBuffer()), filename: name });
+      accepted.push({ data: Buffer.from(await response.arrayBuffer()), filename: name, contentType: attachment.contentType });
     } catch (error) {
       logger.warn(`Echec de telechargement de la piece jointe ${name} pour le ticket ${ticketId}`, error);
       rejected.push(`${name} (échec du téléchargement, réessaie)`);
@@ -529,7 +532,7 @@ async function handleOrderSelectItem(interaction: Interaction): Promise<void> {
   if (!interaction.isStringSelectMenu()) return;
 
   const catalogItemId = interaction.values[0];
-  const item = await getItemWithImage(interaction.guildId!, catalogItemId);
+  const item = await getItem(interaction.guildId!, catalogItemId);
   if (!item) {
     await interaction.reply({ content: "Cet article n'existe plus.", ephemeral: true });
     return;
@@ -542,10 +545,10 @@ async function handleOrderSelectItem(interaction: Interaction): Promise<void> {
   if (item.description) embed.setDescription(item.description);
 
   const files = [];
-  if (item.imageData && item.imageFilename) {
-    const { attachment, url } = buildImageAttachment(Buffer.from(item.imageData), item.imageFilename);
-    embed.setImage(url);
-    files.push(attachment);
+  const image = await resolveImageDisplay({ url: item.imageUrl, filename: item.imageFilename }, `catalog-items/${item.id}`);
+  if (image) {
+    embed.setImage(image.url);
+    if (image.attachment) files.push(image.attachment);
   }
 
   const confirmButton = new ButtonBuilder().setCustomId(`order:confirm-item:${item.id}`).setLabel("Continuer").setStyle(ButtonStyle.Success);
@@ -1339,15 +1342,20 @@ async function handleServiceSetImageSelect(interaction: Interaction): Promise<vo
     await interaction.editReply({ content: "Cette image dépasse 8 Mo, réessaie avec un fichier plus léger." });
     return;
   }
+  if (!isImageAttachment(attachment)) {
+    await interaction.editReply({ content: "Seules les images sont acceptées (png, jpg, gif, webp)." });
+    return;
+  }
 
   try {
-    // On telecharge les octets pour les posseder (stockes en base, voir `setItemImage`) plutot
-    // que de garder l'URL CDN Discord de l'attachment : celle-ci cesse de repondre (404) des
-    // que son message est supprime, meme avant l'expiration du lien signe. Les possedant, on
-    // peut supprimer ce message tout de suite sans rien casser.
+    // On telecharge les octets pour les posseder (stockes sur le CDN ou en base selon
+    // l'environnement, voir `setItemImage`) plutot que de garder l'URL CDN Discord de
+    // l'attachment : celle-ci cesse de repondre (404) des que son message est supprime, meme
+    // avant l'expiration du lien signe. Les possedant, on peut supprimer ce message tout de
+    // suite sans rien casser.
     const response = await fetch(attachment.url, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
     const data = Buffer.from(await response.arrayBuffer());
-    await setItemImage(interaction.guildId, itemId, data, attachment.name ?? "photo.png");
+    await setItemImage(interaction.guildId, itemId, data, attachment);
     await photoMessage.delete().catch((error: unknown) => logger.warn("Echec suppression du message photo dans le panneau", error));
     await refreshServicePanelMessage(interaction.client, interaction.guildId, interaction.channelId);
     await interaction.editReply({ content: "Photo mise à jour." });
@@ -1501,13 +1509,17 @@ async function handlePanelServiceSetBanner(interaction: Interaction): Promise<vo
     await interaction.editReply({ content: "Cette image dépasse 8 Mo, réessaie avec un fichier plus léger." });
     return;
   }
+  if (!isImageAttachment(attachment)) {
+    await interaction.editReply({ content: "Seules les images sont acceptées (png, jpg, gif, webp)." });
+    return;
+  }
 
   try {
-    // Meme raisonnement que la photo d'article : on possede les octets plutot que l'URL CDN,
-    // pour pouvoir supprimer ce message sans casser la banniere sur les factures.
+    // Meme raisonnement que la photo d'article : on possede les octets plutot que l'URL CDN
+    // Discord, pour pouvoir supprimer ce message sans casser la banniere sur les factures.
     const response = await fetch(attachment.url, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
     const data = Buffer.from(await response.arrayBuffer());
-    await setShopBanner(interaction.guildId, data, attachment.name ?? "banniere.png");
+    await setShopBanner(interaction.guildId, data, attachment);
     await photoMessage.delete().catch((error: unknown) => logger.warn("Echec suppression du message banniere dans le panneau", error));
     await refreshServicePanelMessage(interaction.client, interaction.guildId, interaction.channelId);
     await interaction.editReply({ content: "Bannière mise à jour." });

@@ -34,7 +34,7 @@ export async function getOrCreateOrder(ticketId: string) {
  */
 export async function addItemFromAnswers(
   orderId: string,
-  catalogItem: Omit<CatalogItem, "imageData">,
+  catalogItem: CatalogItem,
   answers: { field: CatalogItemField; value: string }[]
 ) {
   const quantityAnswer = answers.find((a) => a.field.style === "QUANTITY");

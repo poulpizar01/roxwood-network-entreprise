@@ -30,6 +30,7 @@ services:
       CLIENT_ID: ${CLIENT_ID}
       DEV_GUILD_ID: ${DEV_GUILD_ID}
       DATABASE_URL: postgresql://${POSTGRES_USER:-roxwood_network}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-roxwood_network}
+      CDN_TOKEN: ${CDN_TOKEN}
     # Limite volontairement large pour un bot Discord de cette taille : protege le VPS entier
     # (partage avec d'autres services) contre une fuite memoire du bot, sans le faire tomber
     # dans des conditions normales d'usage.

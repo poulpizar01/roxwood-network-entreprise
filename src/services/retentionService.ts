@@ -1,4 +1,5 @@
 import { prisma } from "../db/prisma.js";
+import { deleteStoredImage } from "../utils/imageAttachment.js";
 import { logger } from "../utils/logger.js";
 
 /**
@@ -8,9 +9,9 @@ import { logger } from "../utils/logger.js";
  * - `MonitoringEvent` : journal brut de chaque log FiveM traite, jamais relu nulle part dans
  *   le code (audit/rejeu uniquement) — sur un serveur RP actif, plusieurs milliers de lignes
  *   par jour ecrites pour rien au-dela d'une fenetre de retention raisonnable.
- * - `RecruitmentAttachment` : les octets des pieces jointes de candidature restent en base
- *   pour toujours par defaut, meme apres fermeture du ticket, alors que plus personne n'a de
- *   raison d'y acceder passe un delai raisonnable.
+ * - `RecruitmentAttachment` : les images des pieces jointes de candidature (CDN ou disque
+ *   local, voir `storeImage`) restent stockees pour toujours par defaut, meme apres fermeture
+ *   du ticket, alors que plus personne n'a de raison d'y acceder passe un delai raisonnable.
  *
  * Ne touche jamais `MonitoringSafeMovement` (ledger de stock des coffres) : contrairement a
  * `MonitoringEvent`, ces lignes sont sommees a la demande pour calculer le stock courant
@@ -34,8 +35,14 @@ async function purgeOldMonitoringEvents(): Promise<number> {
   return count;
 }
 
+/**
+ * Recupere d'abord les ids concernes (plutot qu'un `deleteMany` direct) pour pouvoir liberer
+ * leur image stockee (CDN ou disque local, voir `deleteStoredImage`) avant de supprimer les
+ * lignes — sans quoi ce fichier resterait orphelin pour toujours, la ligne qui le referencait
+ * n'existant plus pour le retrouver.
+ */
 async function purgeOldRecruitmentAttachments(): Promise<number> {
-  const { count } = await prisma.recruitmentAttachment.deleteMany({
+  const stale = await prisma.recruitmentAttachment.findMany({
     where: {
       application: {
         ticket: {
@@ -44,6 +51,13 @@ async function purgeOldRecruitmentAttachments(): Promise<number> {
         },
       },
     },
+    select: { id: true },
+  });
+  if (stale.length === 0) return 0;
+
+  await Promise.all(stale.map((a) => deleteStoredImage(`recruitment-attachments/${a.id}`)));
+  const { count } = await prisma.recruitmentAttachment.deleteMany({
+    where: { id: { in: stale.map((a) => a.id) } },
   });
   return count;
 }

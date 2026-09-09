@@ -3,7 +3,8 @@ import { addAttachments, getApplication, getApplicationSummary, saveLogMessageRe
 import { getTicketById } from "./ticketService.js";
 import { getGuildConfig, setRecruitmentStatusMessageId } from "./guildConfigService.js";
 import { prisma } from "../db/prisma.js";
-import { buildImageAttachment } from "../utils/imageAttachment.js";
+import { resolveImageDisplay } from "../utils/imageAttachment.js";
+import { isCdnEnabled } from "../utils/cdnStorage.js";
 import { logger } from "../utils/logger.js";
 
 /**
@@ -15,16 +16,19 @@ import { logger } from "../utils/logger.js";
  *
  * Les pieces jointes du candidat ne sont chargees et affichees qu'une seule fois, au moment ou
  * il clique "J'ai terminé d'envoyer mes fichiers" (voir `finalizeRecruitmentAttachments`) —
- * jamais de facon incrementale a chaque fichier recu. Ce choix n'est pas qu'une question
- * d'efficacite : verifie en conditions reelles, Discord ne persiste pas de facon fiable
- * l'image d'un embed nouvellement ajoute a un message existant via `PATCH` (meme quand la
- * reponse de l'appel l'affichait correctement juste apres l'edition, une relecture immediate
- * du message ne la montrait plus). Une image ajoutee en une seule fois via `POST` (nouveau
- * message) fonctionne de facon fiable — d'ou le choix de tout charger en un seul envoi plutot
- * que d'editer le message au fur et a mesure. Une fois les URLs Discord capturees (voir
- * `RecruitmentAttachment.discordUrl`), les rafraichissements suivants (changement de statut,
- * assignation) sont de simples editions de texte qui reutilisent ces URLs deja resolues, sans
- * plus jamais toucher aux pieces jointes du message.
+ * jamais de facon incrementale a chaque fichier recu. En mode CDN (production, `CDN_TOKEN`
+ * configure), chaque image a deja une URL stable et externe (`imageUrl`) des sa reception :
+ * une simple edition du message suffit alors, sans jamais toucher aux pieces jointes Discord.
+ * En mode base (dev local, pas de CDN), ce n'est pas qu'une question d'efficacite : verifie en
+ * conditions reelles, Discord ne persiste pas de facon fiable l'image d'un embed nouvellement
+ * ajoute a un message existant via `PATCH` (meme quand la reponse de l'appel l'affichait
+ * correctement juste apres l'edition, une relecture immediate du message ne la montrait plus).
+ * Une image ajoutee en une seule fois via `POST` (nouveau message) fonctionne de facon fiable —
+ * d'ou, dans ce mode, le choix de supprimer puis reposter le message plutot que de l'editer.
+ * Une fois les URLs Discord capturees (voir `RecruitmentAttachment.discordUrl`), les
+ * rafraichissements suivants (changement de statut, assignation) restent de simples editions
+ * de texte qui reutilisent ces URLs deja resolues, sans plus jamais toucher aux pieces jointes
+ * du message.
  */
 
 /** Etapes du pipeline de recrutement proposees dans le menu deroulant "Statut". */
@@ -43,11 +47,12 @@ export function recruitmentStatusLabel(status: string): string {
 /**
  * Construit l'embed principal de suivi d'une candidature (candidat, salon, statut, recruteur,
  * reponses au formulaire, liste des pieces jointes) ainsi qu'un embed image supplementaire par
- * piece jointe image deja resolue (`discordUrl` non nul — voir `finalizeRecruitmentAttachments`).
- * Ne touche jamais aux octets ni aux pieces jointes du message : uniquement du texte et des
- * URLs Discord deja connues, donc toujours sur d'etre applique par une simple edition. Reutilise
- * a la fois pour le premier envoi (texte seul, aucune piece jointe encore) et pour la mise a
- * jour du message apres un changement de statut/assignation.
+ * piece jointe image deja resolue — `imageUrl` (CDN, production) si present, sinon `discordUrl`
+ * (dev/base, voir `finalizeRecruitmentAttachments`). Ne touche jamais aux octets ni aux pieces
+ * jointes du message : uniquement du texte et des URLs deja connues, donc toujours sur d'etre
+ * applique par une simple edition. Reutilise a la fois pour le premier envoi (texte seul,
+ * aucune piece jointe encore), la finalisation en mode CDN, et la mise a jour du message apres
+ * un changement de statut/assignation.
  */
 export function buildRecruitmentEmbed(
   ticket: { channelId: string; openerId: string | null },
@@ -55,7 +60,7 @@ export function buildRecruitmentEmbed(
     status: string;
     recruiterId: string | null;
     answers: { question: string; answer: string }[];
-    attachments: { filename: string; discordUrl: string | null }[];
+    attachments: { filename: string; imageUrl?: string | null; discordUrl: string | null }[];
   }
 ): EmbedBuilder[] {
   const embed = new EmbedBuilder()
@@ -77,7 +82,8 @@ export function buildRecruitmentEmbed(
     });
 
     for (const a of application.attachments) {
-      if (a.discordUrl) imageEmbeds.push(new EmbedBuilder().setTitle(a.filename).setColor(0x5865f2).setImage(a.discordUrl));
+      const url = a.imageUrl ?? a.discordUrl;
+      if (url) imageEmbeds.push(new EmbedBuilder().setTitle(a.filename).setColor(0x5865f2).setImage(url));
     }
   }
 
@@ -145,22 +151,25 @@ export async function refreshRecruitmentLogMessage(client: Client, ticketId: str
 }
 
 /**
- * Charge et affiche, en une seule fois, les pieces jointes que le candidat a envoyees dans le
- * salon du ticket — declenchee par le bouton "J'ai terminé d'envoyer mes fichiers" (voir
+ * Charge et affiche, en une seule fois, les pieces jointes (images) que le candidat a envoyees
+ * dans le salon du ticket — declenchee par le bouton "J'ai terminé d'envoyer mes fichiers" (voir
  * `handleRecruitmentFinishAttachments` dans `interactionCreate.ts`). `files` : octets deja
- * telecharges par l'appelant depuis les URL CDN Discord des messages du candidat.
+ * telecharges et verifies comme images par l'appelant, depuis les URL CDN Discord des messages
+ * du candidat. Le stockage effectif (CDN ou base) est decide par `addAttachments`.
  *
- * Puisqu'une image ne peut pas etre ajoutee de facon fiable a un message existant par edition
- * (voir le commentaire en tete de fichier), le message de suivi existant (texte seul, envoye a
- * la soumission du formulaire) est supprime puis reposte integralement avec les images cette
- * fois — en un seul `POST`, la seule methode fiable constatee. Les URLs Discord finales de
- * chaque image sont ensuite capturees et stockees, pour que tous les rafraichissements
- * ulterieurs (`refreshRecruitmentLogMessage`) restent de simples editions de texte.
+ * En mode CDN (voir `isCdnEnabled`), chaque image a deja une URL stable et externe : une simple
+ * edition du message existant suffit (ou un premier envoi s'il n'existait pas encore). En mode
+ * base/dev, une image ne peut pas etre ajoutee de facon fiable a un message existant par edition
+ * (voir le commentaire en tete de fichier) : le message de suivi existant est donc supprime puis
+ * reposte integralement avec les images cette fois — en un seul `POST`, la seule methode fiable
+ * constatee — et les URLs Discord finales de chaque image sont ensuite capturees et stockees,
+ * pour que tous les rafraichissements ulterieurs (`refreshRecruitmentLogMessage`) restent de
+ * simples editions de texte.
  */
 export async function finalizeRecruitmentAttachments(
   client: Client,
   ticketId: string,
-  files: { data: Buffer; filename: string }[]
+  files: { data: Buffer; filename: string; contentType?: string | null }[]
 ): Promise<void> {
   await addAttachments(ticketId, files);
 
@@ -173,40 +182,40 @@ export async function finalizeRecruitmentAttachments(
     : await resolveRecruitmentLogChannel(client, ticket.guildId, ticket.channelId).catch(() => null);
   if (!channel?.isTextBased() || channel.isDMBased()) return;
 
+  if (isCdnEnabled()) {
+    const embeds = buildRecruitmentEmbed(ticket, application);
+    const components = [buildRecruitmentActionRow(ticketId)];
+    const oldMessage = application.logMessageId ? await channel.messages.fetch(application.logMessageId).catch(() => null) : null;
+    if (oldMessage) {
+      await oldMessage.edit({ embeds, components });
+      return;
+    }
+    const newMessage = await channel.send({ embeds, components });
+    await saveLogMessageRef(ticketId, channel.id, newMessage.id);
+    return;
+  }
+
   // Le texte est identique a `buildRecruitmentEmbed`, mais ici les images sont fraichement
   // uploadees (`attachment://`) puisque c'est le tout premier — et unique — envoi qui les
   // introduit, plutot que reutilisees via une URL deja connue (il n'y en a pas encore).
-  const infoEmbed = new EmbedBuilder()
-    .setTitle("Candidature")
-    .setColor(0x5865f2)
-    .addFields(
-      { name: "Candidat", value: ticket.openerId ? `<@${ticket.openerId}>` : "inconnu", inline: true },
-      { name: "Ticket", value: `<#${ticket.channelId}>`, inline: true },
-      { name: "Statut", value: `**${recruitmentStatusLabel(application.status)}**`, inline: true },
-      { name: "Recruteur", value: application.recruiterId ? `<@${application.recruiterId}>` : "non assigné", inline: true },
-      ...application.answers.map((a) => ({ name: a.question, value: a.answer || "-" }))
-    );
+  const [infoEmbed] = buildRecruitmentEmbed(ticket, application);
 
   const uploadFiles: AttachmentBuilder[] = [];
   const imageEmbeds: EmbedBuilder[] = [];
-  // On associe chaque piece jointe image a son embed dans le meme ordre, pour retrouver apres
-  // coup quelle URL Discord finale correspond a quelle ligne `RecruitmentAttachment`.
+  // On associe chaque piece jointe a son embed dans le meme ordre, pour retrouver apres coup
+  // quelle URL Discord finale correspond a quelle ligne `RecruitmentAttachment`.
   const imageAttachmentIds: string[] = [];
 
-  if (application.attachments.length > 0) {
-    infoEmbed.addFields({
-      name: "Pièces jointes",
-      value: application.attachments.map((a, i) => a.filename || `Fichier ${i + 1}`).join("\n"),
-    });
-
-    application.attachments.forEach((a, i) => {
-      if (!/\.(png|jpe?g|gif|webp)$/i.test(a.filename)) return;
-      const uniqueName = `${i}-${a.filename || "fichier"}`;
-      const built = buildImageAttachment(Buffer.from(a.data), uniqueName);
-      uploadFiles.push(built.attachment);
-      imageEmbeds.push(new EmbedBuilder().setTitle(a.filename).setColor(0x5865f2).setImage(built.url));
-      imageAttachmentIds.push(a.id);
-    });
+  for (const [i, a] of application.attachments.entries()) {
+    // `uniqueName` (plutot que `a.filename` tel quel) : plusieurs fichiers du candidat peuvent
+    // partager le meme nom, ce qui rendrait ambigue la reference `attachment://` de chacun dans
+    // le meme message.
+    const uniqueName = `${i}-${a.filename || "fichier"}`;
+    const image = await resolveImageDisplay({ url: a.imageUrl, filename: a.filename }, `recruitment-attachments/${a.id}`, uniqueName);
+    if (!image?.attachment) continue;
+    uploadFiles.push(image.attachment);
+    imageEmbeds.push(new EmbedBuilder().setTitle(a.filename).setColor(0x5865f2).setImage(image.url));
+    imageAttachmentIds.push(a.id);
   }
 
   if (application.logMessageId) {

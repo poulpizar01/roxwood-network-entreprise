@@ -11,6 +11,13 @@ const envSchema = z.object({
   CLIENT_ID: z.string().min(1, "CLIENT_ID manquant"),
   DATABASE_URL: z.string().min(1, "DATABASE_URL manquant"),
   DEV_GUILD_ID: z.string().optional(),
+  /**
+   * Token du CDN de stockage d'images (storage.fbfa.fr) — uniquement present en production.
+   * Sa seule presence/absence decide du mode de stockage des images (voir `imageStorage.ts`) :
+   * present -> upload vers le CDN, URL stockee en base ; absent (dev local) -> octets stockes
+   * directement en base comme avant, aucune tentative d'appel au CDN.
+   */
+  CDN_TOKEN: z.string().optional(),
 });
 
 const parsed = envSchema.safeParse(process.env);

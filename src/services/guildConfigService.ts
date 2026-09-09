@@ -7,6 +7,7 @@ import {
   type TicketType,
 } from "@prisma/client";
 import { prisma } from "../db/prisma.js";
+import { deleteStoredImage, storeImage } from "../utils/imageAttachment.js";
 
 /**
  * Ce service centralise la lecture/ecriture de la configuration par serveur (`GuildConfig`)
@@ -18,14 +19,9 @@ import { prisma } from "../db/prisma.js";
 
 /**
  * GuildConfig avec ses categories de tickets et salons de monitoring deja charges (evite un
- * aller-retour DB supplementaire) — sans `shopBannerData` : cette config est mise en cache et
- * relue a quasiment chaque evenement Discord (channelCreate, messageCreate, chaque
- * interaction...), alors que les octets de la banniere ne servent qu'a la generation d'une
- * facture (voir `getShopBanner` ci-dessous, interroge separement a la demande). Omettre le
- * champ ici force une erreur de compilation si un appelant tente d'y acceder par erreur sur
- * cette config partagee, plutot qu'un `undefined` silencieux a l'execution.
+ * aller-retour DB supplementaire).
  */
-type GuildConfigWithCategories = Omit<GuildConfig, "shopBannerData"> & {
+type GuildConfigWithCategories = GuildConfig & {
   ticketCategories: TicketCategoryConfig[];
   monitoringChannels: MonitoringChannelConfig[];
 };
@@ -48,24 +44,23 @@ export async function getGuildConfig(guildId: string): Promise<GuildConfigWithCa
   const config = await prisma.guildConfig.findUnique({
     where: { guildId },
     include: { ticketCategories: true, monitoringChannels: true },
-    omit: { shopBannerData: true },
   });
   if (config) cache.set(guildId, config);
   return config;
 }
 
 /**
- * Recupere les octets de la banniere de facture, en dehors du cache partage (voir
- * `GuildConfigWithCategories`) — interrogee uniquement au moment de generer une facture
- * (`orderLogService.ts`), un evenement bien plus rare qu'un message/une interaction.
+ * Recupere la banniere de facture (URL CDN ou reference au fichier local selon l'environnement,
+ * voir `resolveImageDisplay`) — interrogee uniquement au moment de generer une facture
+ * (`orderLogService.ts`). `null` si aucune banniere configuree.
  */
-export async function getShopBanner(guildId: string): Promise<{ shopBannerData: Buffer; shopBannerFilename: string } | null> {
+export async function getShopBanner(guildId: string): Promise<{ url: string | null; filename: string | null } | null> {
   const config = await prisma.guildConfig.findUnique({
     where: { guildId },
-    select: { shopBannerData: true, shopBannerFilename: true },
+    select: { shopBannerUrl: true, shopBannerFilename: true },
   });
-  if (!config?.shopBannerData || !config.shopBannerFilename) return null;
-  return { shopBannerData: Buffer.from(config.shopBannerData), shopBannerFilename: config.shopBannerFilename };
+  if (!config?.shopBannerFilename) return null;
+  return { url: config.shopBannerUrl, filename: config.shopBannerFilename };
 }
 
 /**
@@ -92,7 +87,6 @@ async function ensureGuildConfig(guildId: string): Promise<GuildConfigWithCatego
       create: { guildId },
       update: {},
       include: { ticketCategories: true, monitoringChannels: true },
-      omit: { shopBannerData: true },
     });
     cache.set(guildId, config);
     return config;
@@ -109,7 +103,6 @@ async function refresh(guildId: string): Promise<GuildConfigWithCategories> {
   const config = await prisma.guildConfig.findUniqueOrThrow({
     where: { guildId },
     include: { ticketCategories: true, monitoringChannels: true },
-    omit: { shopBannerData: true },
   });
   cache.set(guildId, config);
   return config;
@@ -351,17 +344,26 @@ export async function setShopProfile(
   return refresh(guildId);
 }
 
-/** Definit la banniere affichee en bas de chaque facture, en octets bruts (voir `shopBannerData` dans le schema). */
-export async function setShopBanner(guildId: string, data: Buffer, filename: string): Promise<GuildConfigWithCategories> {
+/** Definit la banniere affichee en bas de chaque facture — sur le CDN en production, sur disque local en dev (voir `storeImage`). */
+export async function setShopBanner(
+  guildId: string,
+  data: Buffer,
+  attachment: { contentType?: string | null; name?: string | null }
+): Promise<GuildConfigWithCategories> {
   await ensureGuildConfig(guildId);
-  await prisma.guildConfig.update({ where: { guildId }, data: { shopBannerData: data, shopBannerFilename: filename } });
+  const stored = await storeImage(`shop-banners/${guildId}`, data, attachment);
+  await prisma.guildConfig.update({
+    where: { guildId },
+    data: { shopBannerUrl: stored.url, shopBannerFilename: attachment.name ?? "banniere.png" },
+  });
   return refresh(guildId);
 }
 
-/** Retire la banniere des factures. */
+/** Retire la banniere des factures, y compris sur le CDN/disque local si elle y etait (voir `deleteStoredImage`). */
 export async function clearShopBanner(guildId: string): Promise<GuildConfigWithCategories> {
   await ensureGuildConfig(guildId);
-  await prisma.guildConfig.update({ where: { guildId }, data: { shopBannerData: null, shopBannerFilename: null } });
+  await deleteStoredImage(`shop-banners/${guildId}`);
+  await prisma.guildConfig.update({ where: { guildId }, data: { shopBannerUrl: null, shopBannerFilename: null } });
   return refresh(guildId);
 }
 

@@ -1,5 +1,6 @@
 import type { ApplicationStatus } from "@prisma/client";
 import { prisma } from "../db/prisma.js";
+import { storeImage } from "../utils/imageAttachment.js";
 import { getTicketById } from "./ticketService.js";
 import { dispatchWebhook } from "./webhookDispatcher.js";
 
@@ -101,21 +102,33 @@ export async function saveLogMessageRef(ticketId: string, logChannelId: string, 
 }
 
 /**
- * Rattache en une seule fois toutes les pieces jointes (image, document) que le candidat a
- * envoyees en message classique dans le salon du ticket, une fois qu'il a clique "J'ai terminé"
- * (voir `handleRecruitmentFinishAttachments`) — les modals Discord ne supportant pas l'upload
- * de fichier, c'est le seul moyen technique de joindre des fichiers a une candidature. Les
- * octets (deja telecharges par l'appelant depuis l'URL CDN Discord) sont stockes directement
- * plutot que cette URL, qui est signee et expire. Un seul `dispatchRecruitmentUpdated` pour
- * tout le lot plutot qu'un par fichier — evite de spammer les webhooks abonnes d'un evenement
- * par piece jointe alors qu'elles arrivent toutes ensemble, en une seule action candidat.
+ * Rattache en une seule fois toutes les images que le candidat a envoyees en message classique
+ * dans le salon du ticket, une fois qu'il a clique "J'ai terminé" (voir
+ * `handleRecruitmentFinishAttachments`) — les modals Discord ne supportant pas l'upload de
+ * fichier, c'est le seul moyen technique de joindre des fichiers a une candidature. Chaque
+ * ligne est d'abord creee (pour obtenir son id, cle deterministe utilisee par `storeImage` —
+ * voir `RecruitmentAttachment.imageUrl`), puis mise a jour avec le resultat du stockage : sur
+ * le CDN en production (seule l'URL est alors gardee), sur disque local en dev — jamais l'URL
+ * Discord d'origine, qui est signee et expire. Un seul `dispatchRecruitmentUpdated` pour tout
+ * le lot plutot qu'un par fichier — evite de spammer les webhooks abonnes d'un evenement par
+ * piece jointe alors qu'elles arrivent toutes ensemble, en une seule action candidat.
  */
-export async function addAttachments(ticketId: string, files: { data: Buffer; filename: string }[]) {
+export async function addAttachments(
+  ticketId: string,
+  files: { data: Buffer; filename: string; contentType?: string | null }[]
+) {
   if (files.length === 0) return [];
 
   const application = await prisma.recruitmentApplication.findUniqueOrThrow({ where: { ticketId } });
   const created = await prisma.$transaction(
-    files.map((f) => prisma.recruitmentAttachment.create({ data: { applicationId: application.id, data: f.data, filename: f.filename } }))
+    files.map((f) => prisma.recruitmentAttachment.create({ data: { applicationId: application.id, filename: f.filename } }))
+  );
+  await Promise.all(
+    created.map(async (row, i) => {
+      const file = files[i];
+      const stored = await storeImage(`recruitment-attachments/${row.id}`, file.data, { contentType: file.contentType, name: file.filename });
+      await prisma.recruitmentAttachment.update({ where: { id: row.id }, data: { imageUrl: stored.url } });
+    })
   );
   await dispatchRecruitmentUpdated(ticketId);
   return created;
@@ -136,11 +149,11 @@ export async function setAttachmentDiscordUrls(urls: { attachmentId: string; dis
 }
 
 /**
- * Recupere la candidature d'un ticket avec ses reponses et pieces jointes (octets compris),
- * ou `null` si aucune n'existe — a n'utiliser que quand les octets sont reellement necessaires
- * (voir `finalizeRecruitmentAttachments`, qui doit uploader les fichiers une premiere et
- * unique fois). Pour tout le reste (verifier un statut, construire le payload d'un webhook,
- * rafraichir le texte du message de suivi...), preferer `getApplicationSummary`.
+ * Recupere la candidature complete d'un ticket (tous les champs scalaires, reponses et pieces
+ * jointes), ou `null` si aucune n'existe — a n'utiliser que quand ces champs complets sont
+ * reellement necessaires (voir `finalizeRecruitmentAttachments`). Pour tout le reste (verifier
+ * un statut, construire le payload d'un webhook, rafraichir le texte du message de suivi...),
+ * preferer `getApplicationSummary`, qui ne charge qu'un sous-ensemble cible des champs.
  */
 export async function getApplication(ticketId: string) {
   return prisma.recruitmentApplication.findUnique({
@@ -150,8 +163,9 @@ export async function getApplication(ticketId: string) {
 }
 
 /**
- * Comme `getApplication`, sans les octets des pieces jointes (juste leur nom et l'URL Discord
- * deja resolue de l'image, voir `RecruitmentAttachment.discordUrl`) — pour les usages qui n'ont
+ * Comme `getApplication`, en ne chargeant qu'un sous-ensemble cible des champs (statut,
+ * recruteur, references du message de suivi, reponses, et juste le nom/les URLs des pieces
+ * jointes — voir `RecruitmentAttachment.imageUrl`/`discordUrl`) — pour les usages qui n'ont
  * besoin que de metadonnees (verifier un statut, construire le payload d'un webhook, rafraichir
  * le texte du message de suivi) et n'ont jamais besoin de re-uploader un fichier.
  */
@@ -165,7 +179,7 @@ export async function getApplicationSummary(ticketId: string) {
       logChannelId: true,
       logMessageId: true,
       answers: { select: { question: true, answer: true } },
-      attachments: { select: { filename: true, discordUrl: true } },
+      attachments: { select: { filename: true, imageUrl: true, discordUrl: true } },
     },
   });
 }

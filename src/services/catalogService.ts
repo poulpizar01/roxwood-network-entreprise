@@ -1,5 +1,6 @@
 import type { CatalogFieldStyle } from "@prisma/client";
 import { prisma } from "../db/prisma.js";
+import { deleteStoredImage, storeImage } from "../utils/imageAttachment.js";
 
 /**
  * Service de gestion du catalogue produits/services (`CatalogItem`) et de ses champs
@@ -26,22 +27,21 @@ export async function addItem(guildId: string, data: { name: string; price: numb
   });
 }
 
-/** Supprime un article du catalogue. No-op si l'id n'existe pas ou n'appartient pas a cette guilde. */
+/**
+ * Supprime un article du catalogue. No-op si l'id n'existe pas ou n'appartient pas a cette
+ * guilde. Supprime aussi son image sur le CDN si elle y etait (voir `storeImage`) — no-op en
+ * dev local (pas de CDN), et sans effet si l'article n'avait pas de photo.
+ */
 export async function removeItem(guildId: string, id: string) {
+  await deleteStoredImage(`catalog-items/${id}`);
   await prisma.catalogItem.deleteMany({ where: { id, guildId } });
 }
 
-/**
- * Liste les articles actifs d'une guilde, dans l'ordre de creation (utilise pour le menu
- * deroulant client). `omit: { imageData: true }` : aucun appelant n'affiche la photo depuis
- * cette liste (juste nom/prix/description dans un menu), inutile de charger potentiellement
- * plusieurs Mo d'octets par article a chaque ouverture de ticket Service.
- */
+/** Liste les articles actifs d'une guilde, dans l'ordre de creation (utilise pour le menu deroulant client). */
 export async function listActive(guildId: string) {
   return prisma.catalogItem.findMany({
     where: { guildId, active: true },
     orderBy: { createdAt: "asc" },
-    omit: { imageData: true },
   });
 }
 
@@ -65,30 +65,33 @@ export function buildCatalogSelectOptions(items: { id: string; name: string; pri
   });
 }
 
-/**
- * Comme `listActive`, avec les champs personnalises inclus — pour le recapitulatif du
- * panneau. Meme raisonnement pour `omit: { imageData: true }` : la presence d'une photo se
- * verifie via `imageFilename` (toujours defini en meme temps que `imageData`, voir
- * `setItemImage`), pas besoin des octets eux-memes pour ce simple indicateur.
- */
+/** Comme `listActive`, avec les champs personnalises inclus — pour le recapitulatif du panneau. */
 export async function listActiveWithFields(guildId: string) {
   return prisma.catalogItem.findMany({
     where: { guildId, active: true },
     orderBy: { createdAt: "asc" },
     include: { fields: { orderBy: { position: "asc" } } },
-    omit: { imageData: true },
   });
 }
 
 /**
- * Definit (ou remplace) la photo d'un article, stockee en octets bruts plutot qu'une URL
- * Discord (voir le commentaire sur `imageData` dans le schema). Separee de `addItem` : les
- * modals Discord ne supportant pas l'upload de fichier, la photo est envoyee dans un second
- * temps en message classique dans le salon du panneau (voir `handleServiceSetImageSelect`),
- * dont les octets sont telecharges puis le message peut etre supprime sans rien casser.
+ * Definit (ou remplace) la photo d'un article — sur le CDN en production, en octets bruts en
+ * dev local (voir `storeImage`). Separee de `addItem` : les modals Discord ne supportant pas
+ * l'upload de fichier, la photo est envoyee dans un second temps en message classique dans le
+ * salon du panneau (voir `handleServiceSetImageSelect`), dont les octets sont telecharges puis
+ * le message peut etre supprime sans rien casser.
  */
-export async function setItemImage(guildId: string, id: string, imageData: Buffer, imageFilename: string) {
-  await prisma.catalogItem.updateMany({ where: { id, guildId }, data: { imageData, imageFilename } });
+export async function setItemImage(
+  guildId: string,
+  id: string,
+  data: Buffer,
+  attachment: { contentType?: string | null; name?: string | null }
+) {
+  const stored = await storeImage(`catalog-items/${id}`, data, attachment);
+  await prisma.catalogItem.updateMany({
+    where: { id, guildId },
+    data: { imageUrl: stored.url, imageFilename: attachment.name ?? "photo.png" },
+  });
 }
 
 /**
@@ -103,21 +106,9 @@ export async function setItemWeight(guildId: string, id: string, weightGrams: nu
 /**
  * Recupere un article (avec ses champs personnalises, ordonnes par `position`) en verifiant
  * qu'il appartient bien a la guilde donnee — evite qu'un id d'article d'un autre serveur
- * puisse etre utilise par erreur ou malveillance. `omit: { imageData: true }` : la quasi
- * totalite des appelants (composition de commande, gestion du poids/des champs...) n'ont
- * besoin que du nom/prix/champs, jamais des octets de la photo — voir `getItemWithImage` pour
- * le seul appelant qui en a reellement besoin (confirmation d'article cote client).
+ * puisse etre utilise par erreur ou malveillance.
  */
 export async function getItem(guildId: string, id: string) {
-  return prisma.catalogItem.findFirst({
-    where: { id, guildId },
-    include: { fields: { orderBy: { position: "asc" } } },
-    omit: { imageData: true },
-  });
-}
-
-/** Comme `getItem`, avec les octets de la photo inclus — pour l'affichage de la confirmation d'article. */
-export async function getItemWithImage(guildId: string, id: string) {
   return prisma.catalogItem.findFirst({
     where: { id, guildId },
     include: { fields: { orderBy: { position: "asc" } } },
