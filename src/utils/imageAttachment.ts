@@ -3,23 +3,32 @@ import { deleteFromCdn, isCdnEnabled, uploadToCdn } from "./cdnStorage.js";
 import { deleteLocalImage, readLocalImage, writeLocalImage } from "./localImageStorage.js";
 
 /**
- * Taille maximale acceptee pour un fichier telecharge depuis un attachment Discord et stocke
- * en base (photo de catalogue, banniere de facture, piece jointe de candidature) — evite
- * qu'un envoi (volontaire ou non) de fichier volumineux ne gonfle la base sans limite.
+ * Taille maximale acceptee pour une image telechargee depuis un attachment Discord (photo de
+ * catalogue, banniere de facture, piece jointe de candidature) — evite qu'un envoi (volontaire
+ * ou non) de fichier volumineux ne sature la memoire ou le stockage. Reellement garantie au
+ * telechargement par `downloadImageBytes`, pas seulement pre-verifiee sur `attachment.size`.
  */
 export const MAX_UPLOAD_SIZE_BYTES = 8 * 1024 * 1024;
 
-/** Extensions acceptees pour tout upload d'image dans le bot (photo d'article, banniere, piece jointe de candidature). */
-const IMAGE_EXTENSION_REGEX = /\.(png|jpe?g|gif|webp)$/i;
+/**
+ * Types acceptes pour tout upload d'image dans le bot (photo d'article, banniere, piece jointe
+ * de candidature). Les GIF sont volontairement exclus (anime, souvent lourd, pas d'usage
+ * legitime ici).
+ */
+const IMAGE_EXTENSION_REGEX = /\.(png|jpe?g|webp)$/i;
+const REJECTED_IMAGE_CONTENT_TYPES = new Set(["image/gif"]);
 
 /**
- * Verifie qu'un attachment Discord est bien une image — seul type de fichier accepte par le
- * bot, quel que soit l'endroit (photo d'article, banniere, piece jointe de candidature).
- * Le `contentType` fourni par Discord (quand connu) est plus fiable qu'une extension de nom de
- * fichier (qui peut mentir), d'ou la priorite ; repli sur l'extension s'il est absent.
+ * Verifie qu'un attachment Discord est bien une image acceptee — seul type de fichier accepte
+ * par le bot, quel que soit l'endroit (photo d'article, banniere, piece jointe de candidature),
+ * GIF exclus. Le `contentType` fourni par Discord (quand connu) est plus fiable qu'une
+ * extension de nom de fichier (qui peut mentir), d'ou la priorite ; repli sur l'extension s'il
+ * est absent.
  */
 export function isImageAttachment(attachment: { contentType?: string | null; name?: string | null }): boolean {
-  if (attachment.contentType) return attachment.contentType.startsWith("image/");
+  if (attachment.contentType) {
+    return attachment.contentType.startsWith("image/") && !REJECTED_IMAGE_CONTENT_TYPES.has(attachment.contentType);
+  }
   return IMAGE_EXTENSION_REGEX.test(attachment.name ?? "");
 }
 
@@ -29,7 +38,6 @@ function resolveContentType(attachment: { contentType?: string | null; name?: st
   const name = (attachment.name ?? "").toLowerCase();
   if (name.endsWith(".png")) return "image/png";
   if (name.endsWith(".jpg") || name.endsWith(".jpeg")) return "image/jpeg";
-  if (name.endsWith(".gif")) return "image/gif";
   if (name.endsWith(".webp")) return "image/webp";
   return "application/octet-stream";
 }
@@ -77,6 +85,56 @@ export async function deleteStoredImage(key: string): Promise<void> {
  * indefiniment (jusqu'a expiration du token, ~15 min), sans retour utile pour l'utilisateur.
  */
 export const FETCH_TIMEOUT_MS = 10_000;
+
+/** Levee par `downloadImageBytes` quand l'image telechargee depasse `MAX_UPLOAD_SIZE_BYTES`. */
+export class ImageTooLargeError extends Error {
+  constructor() {
+    super(`Image au-dela de la limite de ${MAX_UPLOAD_SIZE_BYTES} octets`);
+    this.name = "ImageTooLargeError";
+  }
+}
+
+/**
+ * Telecharge les octets d'une image (attachment Discord) en garantissant qu'ils ne depassent
+ * jamais `MAX_UPLOAD_SIZE_BYTES` : rejet immediat sur l'en-tete `Content-Length` quand il est
+ * present, puis comptage au fil de la lecture du flux avec interruption des le depassement —
+ * jamais de corps entier surdimensionne bufferise en memoire. `attachment.size` (renseigne par
+ * Discord) permet deja un pre-rejet cote appelant sans appel reseau, mais ne couvre ni un `size`
+ * absent ni un corps plus gros qu'annonce : ce controle-ci est la garantie reelle.
+ *
+ * @throws ImageTooLargeError si la limite est depassee
+ * @throws Error si la reponse HTTP n'est pas exploitable
+ */
+export async function downloadImageBytes(url: string): Promise<Buffer> {
+  const response = await fetch(url, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
+  if (!response.ok) throw new Error(`Telechargement de l'image echoue (HTTP ${response.status})`);
+
+  const declaredLength = Number(response.headers.get("content-length"));
+  if (Number.isFinite(declaredLength) && declaredLength > MAX_UPLOAD_SIZE_BYTES) {
+    throw new ImageTooLargeError();
+  }
+
+  if (!response.body) {
+    const buffer = Buffer.from(await response.arrayBuffer());
+    if (buffer.byteLength > MAX_UPLOAD_SIZE_BYTES) throw new ImageTooLargeError();
+    return buffer;
+  }
+
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > MAX_UPLOAD_SIZE_BYTES) {
+      await reader.cancel();
+      throw new ImageTooLargeError();
+    }
+    chunks.push(value);
+  }
+  return Buffer.concat(chunks);
+}
 
 /**
  * Construit une piece jointe Discord a partir d'octets (releus sur disque local en dev, voir

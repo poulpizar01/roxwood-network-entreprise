@@ -117,7 +117,7 @@ import { createSubscription, listCustomSubscriptions, listSubscriptions, removeS
 import { createSheetSync, listSheetSyncs, removeSheetSync } from "../services/sheetSyncService.js";
 import type { MonitoringLogType } from "@prisma/client";
 import { logger } from "../utils/logger.js";
-import { FETCH_TIMEOUT_MS, isImageAttachment, MAX_UPLOAD_SIZE_BYTES, resolveImageDisplay } from "../utils/imageAttachment.js";
+import { downloadImageBytes, ImageTooLargeError, isImageAttachment, MAX_UPLOAD_SIZE_BYTES, resolveImageDisplay } from "../utils/imageAttachment.js";
 
 /**
  * Point d'entree unique pour toutes les interactions Discord (commandes slash, boutons,
@@ -381,7 +381,7 @@ async function handleRecruitmentFinishAttachments(interaction: Interaction, tick
       continue;
     }
     if (!isImageAttachment(attachment)) {
-      rejected.push(`${name} (seules les images sont acceptées)`);
+      rejected.push(`${name} (seules les images sont acceptées : png, jpg, webp — pas de gif)`);
       continue;
     }
     if (attachment.size > MAX_UPLOAD_SIZE_BYTES) {
@@ -389,9 +389,13 @@ async function handleRecruitmentFinishAttachments(interaction: Interaction, tick
       continue;
     }
     try {
-      const response = await fetch(attachment.url, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
-      accepted.push({ data: Buffer.from(await response.arrayBuffer()), filename: name, contentType: attachment.contentType });
+      const data = await downloadImageBytes(attachment.url);
+      accepted.push({ data, filename: name, contentType: attachment.contentType });
     } catch (error) {
+      if (error instanceof ImageTooLargeError) {
+        rejected.push(`${name} (dépasse 8 Mo)`);
+        continue;
+      }
       logger.warn(`Echec de telechargement de la piece jointe ${name} pour le ticket ${ticketId}`, error);
       rejected.push(`${name} (échec du téléchargement, réessaie)`);
     }
@@ -1343,23 +1347,26 @@ async function handleServiceSetImageSelect(interaction: Interaction): Promise<vo
     return;
   }
   if (!isImageAttachment(attachment)) {
-    await interaction.editReply({ content: "Seules les images sont acceptées (png, jpg, gif, webp)." });
+    await interaction.editReply({ content: "Seules les images sont acceptées (png, jpg, webp — pas de gif)." });
     return;
   }
 
   try {
-    // On telecharge les octets pour les posseder (stockes sur le CDN ou en base selon
+    // On telecharge les octets pour les posseder (stockes sur le CDN ou sur disque local selon
     // l'environnement, voir `setItemImage`) plutot que de garder l'URL CDN Discord de
     // l'attachment : celle-ci cesse de repondre (404) des que son message est supprime, meme
     // avant l'expiration du lien signe. Les possedant, on peut supprimer ce message tout de
     // suite sans rien casser.
-    const response = await fetch(attachment.url, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
-    const data = Buffer.from(await response.arrayBuffer());
+    const data = await downloadImageBytes(attachment.url);
     await setItemImage(interaction.guildId, itemId, data, attachment);
     await photoMessage.delete().catch((error: unknown) => logger.warn("Echec suppression du message photo dans le panneau", error));
     await refreshServicePanelMessage(interaction.client, interaction.guildId, interaction.channelId);
     await interaction.editReply({ content: "Photo mise à jour." });
   } catch (error) {
+    if (error instanceof ImageTooLargeError) {
+      await interaction.editReply({ content: "Cette image dépasse 8 Mo, réessaie avec un fichier plus léger." });
+      return;
+    }
     logger.error("Echec du telechargement de la photo d'article", error);
     await interaction.editReply({ content: "Échec du téléchargement de l'image, réessaie avec le bouton." });
   }
@@ -1510,20 +1517,23 @@ async function handlePanelServiceSetBanner(interaction: Interaction): Promise<vo
     return;
   }
   if (!isImageAttachment(attachment)) {
-    await interaction.editReply({ content: "Seules les images sont acceptées (png, jpg, gif, webp)." });
+    await interaction.editReply({ content: "Seules les images sont acceptées (png, jpg, webp — pas de gif)." });
     return;
   }
 
   try {
     // Meme raisonnement que la photo d'article : on possede les octets plutot que l'URL CDN
     // Discord, pour pouvoir supprimer ce message sans casser la banniere sur les factures.
-    const response = await fetch(attachment.url, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
-    const data = Buffer.from(await response.arrayBuffer());
+    const data = await downloadImageBytes(attachment.url);
     await setShopBanner(interaction.guildId, data, attachment);
     await photoMessage.delete().catch((error: unknown) => logger.warn("Echec suppression du message banniere dans le panneau", error));
     await refreshServicePanelMessage(interaction.client, interaction.guildId, interaction.channelId);
     await interaction.editReply({ content: "Bannière mise à jour." });
   } catch (error) {
+    if (error instanceof ImageTooLargeError) {
+      await interaction.editReply({ content: "Cette image dépasse 8 Mo, réessaie avec un fichier plus léger." });
+      return;
+    }
     logger.error("Echec du telechargement de la banniere", error);
     await interaction.editReply({ content: "Échec du téléchargement de l'image, réessaie avec le bouton." });
   }
