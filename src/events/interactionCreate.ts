@@ -117,7 +117,15 @@ import { createSubscription, listCustomSubscriptions, listSubscriptions, removeS
 import { createSheetSync, listSheetSyncs, removeSheetSync } from "../services/sheetSyncService.js";
 import type { MonitoringLogType } from "@prisma/client";
 import { logger } from "../utils/logger.js";
-import { downloadImageBytes, ImageTooLargeError, isImageAttachment, MAX_UPLOAD_SIZE_BYTES, resolveImageDisplay } from "../utils/imageAttachment.js";
+import {
+  downloadImageBytes,
+  IMAGE_TOO_LARGE_MESSAGE,
+  IMAGE_TOO_LARGE_SHORT,
+  ImageTooLargeError,
+  isImageAttachment,
+  MAX_UPLOAD_SIZE_BYTES,
+  resolveImageDisplay,
+} from "../utils/imageAttachment.js";
 
 /**
  * Point d'entree unique pour toutes les interactions Discord (commandes slash, boutons,
@@ -385,7 +393,7 @@ async function handleRecruitmentFinishAttachments(interaction: Interaction, tick
       continue;
     }
     if (attachment.size > MAX_UPLOAD_SIZE_BYTES) {
-      rejected.push(`${name} (dépasse 8 Mo)`);
+      rejected.push(`${name} (${IMAGE_TOO_LARGE_SHORT})`);
       continue;
     }
     try {
@@ -393,7 +401,7 @@ async function handleRecruitmentFinishAttachments(interaction: Interaction, tick
       accepted.push({ data, filename: name, contentType: attachment.contentType });
     } catch (error) {
       if (error instanceof ImageTooLargeError) {
-        rejected.push(`${name} (dépasse 8 Mo)`);
+        rejected.push(`${name} (${IMAGE_TOO_LARGE_SHORT})`);
         continue;
       }
       logger.warn(`Echec de telechargement de la piece jointe ${name} pour le ticket ${ticketId}`, error);
@@ -1343,7 +1351,7 @@ async function handleServiceSetImageSelect(interaction: Interaction): Promise<vo
     return;
   }
   if (attachment.size > MAX_UPLOAD_SIZE_BYTES) {
-    await interaction.editReply({ content: "Cette image dépasse 8 Mo, réessaie avec un fichier plus léger." });
+    await interaction.editReply({ content: IMAGE_TOO_LARGE_MESSAGE });
     return;
   }
   if (!isImageAttachment(attachment)) {
@@ -1364,7 +1372,7 @@ async function handleServiceSetImageSelect(interaction: Interaction): Promise<vo
     await interaction.editReply({ content: "Photo mise à jour." });
   } catch (error) {
     if (error instanceof ImageTooLargeError) {
-      await interaction.editReply({ content: "Cette image dépasse 8 Mo, réessaie avec un fichier plus léger." });
+      await interaction.editReply({ content: IMAGE_TOO_LARGE_MESSAGE });
       return;
     }
     logger.error("Echec du telechargement de la photo d'article", error);
@@ -1513,7 +1521,7 @@ async function handlePanelServiceSetBanner(interaction: Interaction): Promise<vo
     return;
   }
   if (attachment.size > MAX_UPLOAD_SIZE_BYTES) {
-    await interaction.editReply({ content: "Cette image dépasse 8 Mo, réessaie avec un fichier plus léger." });
+    await interaction.editReply({ content: IMAGE_TOO_LARGE_MESSAGE });
     return;
   }
   if (!isImageAttachment(attachment)) {
@@ -1531,7 +1539,7 @@ async function handlePanelServiceSetBanner(interaction: Interaction): Promise<vo
     await interaction.editReply({ content: "Bannière mise à jour." });
   } catch (error) {
     if (error instanceof ImageTooLargeError) {
-      await interaction.editReply({ content: "Cette image dépasse 8 Mo, réessaie avec un fichier plus léger." });
+      await interaction.editReply({ content: IMAGE_TOO_LARGE_MESSAGE });
       return;
     }
     logger.error("Echec du telechargement de la banniere", error);

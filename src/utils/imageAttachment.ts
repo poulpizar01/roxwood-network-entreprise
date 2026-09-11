@@ -11,6 +11,17 @@ import { deleteLocalImage, readLocalImage, writeLocalImage } from "./localImageS
 export const MAX_UPLOAD_SIZE_BYTES = 8 * 1024 * 1024;
 
 /**
+ * Libelle de la limite en Mo, pour les messages utilisateur — derive de `MAX_UPLOAD_SIZE_BYTES`
+ * plutot que redit en dur a chaque endroit qui l'affiche, pour que changer la constante suffise
+ * a mettre a jour tous les messages sans risque d'en oublier un.
+ */
+export const MAX_UPLOAD_SIZE_MB = MAX_UPLOAD_SIZE_BYTES / (1024 * 1024);
+/** Message affiche a l'utilisateur quand une image depasse `MAX_UPLOAD_SIZE_BYTES`. */
+export const IMAGE_TOO_LARGE_MESSAGE = `Cette image dépasse ${MAX_UPLOAD_SIZE_MB} Mo, réessaie avec un fichier plus léger.`;
+/** Variante courte, pour une liste de fichiers rejetes (ex: candidature). */
+export const IMAGE_TOO_LARGE_SHORT = `dépasse ${MAX_UPLOAD_SIZE_MB} Mo`;
+
+/**
  * Types acceptes pour tout upload d'image dans le bot (photo d'article, banniere, piece jointe
  * de candidature). Les GIF sont volontairement exclus (anime, souvent lourd, pas d'usage
  * legitime ici).
@@ -23,11 +34,14 @@ const REJECTED_IMAGE_CONTENT_TYPES = new Set(["image/gif"]);
  * par le bot, quel que soit l'endroit (photo d'article, banniere, piece jointe de candidature),
  * GIF exclus. Le `contentType` fourni par Discord (quand connu) est plus fiable qu'une
  * extension de nom de fichier (qui peut mentir), d'ou la priorite ; repli sur l'extension s'il
- * est absent.
+ * est absent. Le type MIME est compare hors de tout parametre (`;charset=...` etc., autorise
+ * par le standard) : une comparaison stricte sur la chaine brute laisserait passer un GIF dont
+ * le contentType serait decore d'un tel parametre.
  */
 export function isImageAttachment(attachment: { contentType?: string | null; name?: string | null }): boolean {
   if (attachment.contentType) {
-    return attachment.contentType.startsWith("image/") && !REJECTED_IMAGE_CONTENT_TYPES.has(attachment.contentType);
+    const baseType = attachment.contentType.split(";")[0].trim().toLowerCase();
+    return baseType.startsWith("image/") && !REJECTED_IMAGE_CONTENT_TYPES.has(baseType);
   }
   return IMAGE_EXTENSION_REGEX.test(attachment.name ?? "");
 }
