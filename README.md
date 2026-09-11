@@ -1,4 +1,4 @@
-# Roxwood Network
+# Roxwood Network Entreprise
 
 Bot Discord (Node.js + TypeScript + discord.js + Prisma/PostgreSQL) qui ajoute une sur-couche à Ticket Tool pour des serveurs GTA RP, sur deux usages :
 

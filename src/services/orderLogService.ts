@@ -271,7 +271,7 @@ export async function sendInvoiceForOrder(
 ): Promise<void> {
   const invoiceNumber = order.invoiceNumber ?? (await setInvoiceNumber(guildId, order.id));
 
-  let guildName = "Roxwood Network";
+  let guildName = "Roxwood Network Entreprise";
   let customerLabel = "Client";
   try {
     const guild = await client.guilds.fetch(guildId);
