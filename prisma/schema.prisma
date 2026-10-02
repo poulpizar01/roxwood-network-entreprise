@@ -1,5 +1,6 @@
 generator client {
-  provider = "prisma-client-js"
+  provider        = "prisma-client-js"
+  previewFeatures = ["omitApi"]
 }
 
 datasource db {
@@ -7,76 +8,223 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
+/// Configuration du bot pour un serveur Discord donne (une ligne par guilde, isolation
+/// multi-serveur : toutes les autres tables referencent `guildId` et sont filtrees dessus).
 model GuildConfig {
-  id                String   @id @default(cuid())
-  guildId           String   @unique
-  ticketCategoryIds String[]
-  closedCategoryId  String?
-  staffRoleIds      String[]
-  escalationMinutes Int?
-  createdAt         DateTime @default(now())
-  updatedAt         DateTime @updatedAt
+  id                            String   @id @default(cuid())
+  /// Id de la guilde Discord, cle metier utilisee partout ailleurs dans le code (pas `id`).
+  guildId                       String   @unique
+  /// Salon dedie ou sont postes les recaps de candidature (avec boutons Statut/S'assigner),
+  /// pour que le suivi reste visible par le staff sans polluer le salon du ticket (partage
+  /// avec le candidat). `null` = pas configure, le recap est poste dans le salon du ticket.
+  recruitmentLogChannelId       String?
+  /// Si `false`, les nouveaux tickets RECRUITMENT reçoivent un message "recrutements fermés"
+  /// au lieu du bouton de formulaire. N'affecte pas les candidatures deja en cours.
+  recruitmentOpen               Boolean  @default(true)
+  /// Salon designe pour heberger les messages permanents du panneau d'administration
+  /// (voir PanelMessage). Un seul salon par guilde.
+  panelChannelId                String?
+  /// Roles autorises a accepter/refuser une demande d'absence (boutons du message de suivi
+  /// dans `absenceReviewChannelId`). Plusieurs roles possibles (ex: plusieurs paliers de
+  /// management). Vide = personne configure, le bouton "Declarer une absence" reste desactive.
+  absenceApproverRoleIds        String[] @default([])
+  /// Salon dedie ou sont postees les demandes d'absence pour validation staff — separe du
+  /// salon panneau, meme logique que `recruitmentLogChannelId`. `null` = pas configure.
+  absenceReviewChannelId        String?
+  /// jobId (cote script FiveM) sur lequel porte le monitoring de cette guilde. Les logs
+  /// d'autres entreprises passant par les memes salons webhook (serveur FiveM partage entre
+  /// plusieurs entreprises/Discords) sont completement ignores. `null` = monitoring pas
+  /// configure, aucun log traite.
+  monitoringJobId               String?
+  /// Role Discord ajoute a la prise de service, retire a la fin de service.
+  onDutyRoleId                  String?
+  /// Categorie Discord vers laquelle deplacer le salon d'un ticket RECRUITMENT quand sa
+  /// candidature passe a ACCEPTED (manuellement via le bouton Statut, ou automatiquement via
+  /// le log monitoring RECRUITMENT "embauche"). `null` = pas de deplacement automatique.
+  recruitmentAcceptedCategoryId String?
+  /// Role Discord ajoute au candidat des que sa candidature passe a ACCEPTED (meme declencheurs
+  /// que ci-dessus). `null` = pas d'ajout automatique.
+  recruitmentAcceptedRoleId     String?
+  /// Salon ou un message permanent affiche l'etat ouvert/ferme des recrutements (mis a jour en
+  /// place a chaque bascule) — distinct de `recruitmentLogChannelId` (suivi des candidatures
+  /// individuelles, reserve au staff) : celui-ci peut etre rendu visible a tout le monde.
+  /// `null` = pas de message de statut public.
+  recruitmentStatusChannelId    String?
+  /// Id du message de statut recrutement, pour l'editer en place plutot que le reposter a
+  /// chaque bascule. `null` tant que jamais poste.
+  recruitmentStatusMessageId    String?
+  /// RIB affiche sur les factures pour le reglement (coordonnees bancaires in-game).
+  shopRib                       String?
+  /// Numero de telephone de la boutique, affiche en pied de facture.
+  shopPhone                     String?
+  /// URL publique de la banniere affichee en bas de chaque facture : URL CDN en production
+  /// (`CDN_TOKEN` configure), `null` en dev local — les octets vivent alors uniquement sur
+  /// disque (`data/dev-images/`, voir `localImageStorage.ts`), jamais en base, pour ne jamais
+  /// faire dependre le schema de production d'un besoin propre au dev local.
+  shopBannerUrl                 String?
+  /// Nom de fichier associe a la banniere (mode disque local ou CDN), garde dans les deux cas
+  /// pour l'affichage/le debug ; requis par l'API Discord pour le re-upload en mode disque local.
+  shopBannerFilename            String?
+  /// Message de remerciement affiche en pied de facture (ex: "X vous remercie pour votre confiance").
+  shopThankYouMessage           String?
+  /// Capacite d'un camion en grammes, utilisee pour calculer le nombre de camions requis a
+  /// partir du poids total d'une commande (voir `CatalogItem.weightGrams`). `null` = "camions
+  /// requis" jamais affiche sur la facture, meme si des articles ont un poids configure.
+  truckCapacityGrams            Int?
+  /// Dernier numero de facture attribue pour cette guilde (compteur sequentiel par entreprise,
+  /// incremente atomiquement a chaque nouvelle facture — voir `orderService.setInvoiceNumber`).
+  /// Le numero affiche est cet entier converti en chaine, sans prefixe ni lettre.
+  lastInvoiceNumber             Int      @default(0)
+  createdAt                     DateTime @default(now())
+  updatedAt                     DateTime @updatedAt
 
-  tickets        Ticket[]
-  autoReplyRules AutoReplyRule[]
-  webhooks       WebhookSubscription[]
+  tickets              Ticket[]
+  webhooks             WebhookSubscription[]
+  ticketCategories     TicketCategoryConfig[]
+  catalogItems         CatalogItem[]
+  panelMessages        PanelMessage[]
+  absenceRequests      AbsenceRequest[]
+  recruitmentQuestions RecruitmentQuestion[]
+  monitoringChannels   MonitoringChannelConfig[]
+  monitoringEvents     MonitoringEvent[]
+  monitoringSafes      MonitoringSafe[]
+  sheetSyncs           SheetSync[]
 }
 
-model Ticket {
-  id                String         @id @default(cuid())
-  guildId           String
-  channelId         String         @unique
-  categoryId        String
-  openerId          String?
-  status            TicketStatus   @default(OPEN)
-  priority          TicketPriority @default(NORMAL)
-  createdAt         DateTime       @default(now())
-  closedAt          DateTime?
-  firstStaffReplyAt DateTime?
-  lastActivityAt    DateTime       @default(now())
-  escalatedAt       DateTime?
+/// Associe une categorie Discord a un type de ticket ET a ses roles de gestion. Une categorie
+/// absente de cette table n'est pas suivie par le bot (les autres boutons du panel Ticket
+/// Tool restent geres par Ticket Tool seul, hors perimetre). `managerRoleIds` remplace
+/// l'ancien role staff global unique : chaque categorie a sa propre equipe (ex: role RH pour
+/// une categorie Candidatures, role Vente pour une categorie Boutique).
+model TicketCategoryConfig {
+  id             String     @id @default(cuid())
+  guildId        String
+  /// Id de la categorie Discord (celle utilisee par un bouton du panel Ticket Tool).
+  categoryId     String
+  type           TicketType
+  /// Roles autorises a gerer les tickets de cette categorie (boutons Statut/Assigner/etc.,
+  /// detection de la 1ere reponse staff).
+  managerRoleIds String[]   @default([])
 
   guildConfig GuildConfig @relation(fields: [guildId], references: [guildId])
-  tags        TicketTag[]
+
+  @@unique([guildId, categoryId])
+}
+
+/// Les deux usages construits par-dessus Ticket Tool.
+enum TicketType {
+  /// Candidature : formulaire client + pipeline de suivi staff (voir RecruitmentApplication).
+  RECRUITMENT
+  /// Commande : catalogue + composition self-service par le client (voir ServiceOrder).
+  SERVICE
+}
+
+/// Un ticket suivi (canal Discord cree par Ticket Tool dans une categorie mappee).
+/// Porte les champs generiques communs aux deux types ; les details specifiques vivent
+/// dans `application` (RECRUITMENT) ou `order` (SERVICE), en relation 1:1 optionnelle.
+model Ticket {
+  id                String       @id @default(cuid())
+  guildId           String
+  /// Id du canal Discord, cle utilisee par la quasi-totalite du code pour retrouver un ticket.
+  channelId         String       @unique
+  categoryId        String
+  type              TicketType
+  /// Utilisateur ayant ouvert le ticket, devine via les permission overwrites du canal
+  /// (best-effort : peut etre `null` si non determinable).
+  openerId          String?
+  status            TicketStatus @default(OPEN)
+  createdAt         DateTime     @default(now())
+  closedAt          DateTime?
+  /// Renseigne a la 1ere reponse d'un membre du staff (base du calcul de temps de reponse moyen, voir /stats).
+  firstStaffReplyAt DateTime?
+
+  guildConfig GuildConfig             @relation(fields: [guildId], references: [guildId])
+  application RecruitmentApplication?
+  order       ServiceOrder?
 
   @@index([guildId, status])
+  @@index([guildId, type])
 }
 
-model TicketTag {
-  id       String @id @default(cuid())
-  ticketId String
-  tag      String
-
-  ticket Ticket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
-
-  @@unique([ticketId, tag])
-}
-
-model AutoReplyRule {
-  id        String   @id @default(cuid())
-  guildId   String
-  trigger   String
-  response  String
-  enabled   Boolean  @default(true)
-  createdAt DateTime @default(now())
-
-  guildConfig GuildConfig @relation(fields: [guildId], references: [guildId])
-
-  @@index([guildId, enabled])
-}
-
+/// Abonnement d'une URL externe (CRM, site...) a un type d'evenement de ticket. Point de
+/// branchement generique : voir `webhookDispatcher.ts` pour l'envoi (POST JSON signe HMAC).
 model WebhookSubscription {
   id        String   @id @default(cuid())
   guildId   String
+  /// Type d'evenement declencheur (ex: "monitoring.duty", "absence.updated"). Les abonnements
+  /// "personnalises" (voir `label`) utilisent tous la valeur fixe "custom" : jamais declenches
+  /// par un evenement integre du bot, seulement envoyes a la demande du staff
+  /// (`dispatchCustomWebhook`) ou automatiquement par une synchronisation de Google Sheet
+  /// liee (voir `SheetSync`), donc pas besoin d'un type dedie par abonnement.
   eventType String
+  /// Libelle libre, utilise uniquement par les abonnements "custom" pour les distinguer entre
+  /// eux (ex: "Ventes formation", "Villas") quand plusieurs pointent vers des recepteurs
+  /// differents (ex: deux Google Sheets distincts) — c'est ce qui permet au staff de choisir
+  /// lequel viser au moment d'envoyer des donnees. `null` pour les abonnements aux evenements
+  /// integres du bot, ou leur `eventType` suffit deja a les identifier.
+  label     String?
   url       String
+  /// Secret utilise pour signer le corps de la requete (header X-Signature-256).
   secret    String
   enabled   Boolean  @default(true)
   createdAt DateTime @default(now())
 
-  guildConfig GuildConfig @relation(fields: [guildId], references: [guildId])
+  guildConfig      GuildConfig              @relation(fields: [guildId], references: [guildId])
+  sheetSync        SheetSync?
+  deliveryAttempts WebhookDeliveryAttempt[]
 
   @@index([guildId, eventType, enabled])
+}
+
+/// Livraison echouee d'un webhook, en attente de nouvelle tentative — evite de perdre un
+/// evenement si le recepteur est injoignable au moment de l'envoi (site en panne, timeout...).
+/// Le corps JSON (`body`) est stocke tel quel pour renvoyer exactement le meme evenement a
+/// chaque essai ; la signature HMAC est recalculee au moment de chaque tentative (voir
+/// `webhookDispatcher.ts`), avec le secret courant de l'abonnement. Supprimee des qu'une
+/// tentative reussit, ou apres `MAX_DELIVERY_ATTEMPTS` echecs — abandon definitif au-dela,
+/// journalise comme perte de donnees.
+model WebhookDeliveryAttempt {
+  id             String   @id @default(cuid())
+  subscriptionId String
+  eventType      String
+  body           String
+  attempts       Int      @default(1)
+  nextAttemptAt  DateTime
+  lastError      String?
+  createdAt      DateTime @default(now())
+
+  subscription WebhookSubscription @relation(fields: [subscriptionId], references: [id], onDelete: Cascade)
+
+  @@index([nextAttemptAt])
+}
+
+/// Synchronisation reguliere d'un Google Sheet vers un abonnement webhook "custom" existant :
+/// le bot sonde periodiquement l'export CSV public du Sheet (voir `sheetSyncService.ts`) et
+/// transmet chaque nouvelle ligne (celles au-dela de `lastRowCount`) a l'abonnement cible, sans
+/// connaitre ni imposer de schema — la premiere ligne du Sheet sert d'en-tetes, chaque ligne
+/// suivante devient un objet cle/valeur. Choix explicite de l'utilisateur : lecture via export
+/// CSV public (le Sheet doit etre partage "lecture pour toute personne avec le lien") plutot
+/// qu'un compte de service Google, pour ne demander aucun identifiant a stocker cote VPS.
+model SheetSync {
+  id             String   @id @default(cuid())
+  guildId        String
+  /// URL d'export CSV normalisee (ex: https://docs.google.com/spreadsheets/d/<id>/export?format=csv&gid=<gid>) —
+  /// convertie depuis un lien de partage classique au moment de la creation (voir `parseGoogleSheetUrl`).
+  sheetUrl       String
+  /// Abonnement webhook "custom" cible (URL/secret de destination) — chaque abonnement custom
+  /// n'a au plus qu'une seule synchronisation active (relation 1:1).
+  subscriptionId String   @unique
+  /// Nombre de lignes de donnees deja envoyees (hors ligne d'en-tetes), pour ne transmettre au
+  /// prochain sondage que celles ajoutees depuis. Initialise au nombre de lignes deja presentes
+  /// au moment de la creation — on ne renvoie jamais l'historique existant du Sheet.
+  lastRowCount   Int      @default(0)
+  enabled        Boolean  @default(true)
+  createdAt      DateTime @default(now())
+
+  guildConfig  GuildConfig         @relation(fields: [guildId], references: [guildId])
+  subscription WebhookSubscription @relation(fields: [subscriptionId], references: [id], onDelete: Cascade)
+
+  @@index([guildId, enabled])
 }
 
 enum TicketStatus {
@@ -84,9 +232,374 @@ enum TicketStatus {
   CLOSED
 }
 
-enum TicketPriority {
-  LOW
-  NORMAL
-  HIGH
-  URGENT
+/// Candidature associee a un ticket RECRUITMENT (relation 1:1). Cree des l'ouverture du
+/// ticket, remplie ensuite par le formulaire client (`answers`) et pilotee par le staff
+/// (`status`, `recruiterId`).
+model RecruitmentApplication {
+  id           String            @id @default(cuid())
+  ticketId     String            @unique
+  status       ApplicationStatus @default(PENDING)
+  /// Membre du staff s'etant assigne la candidature (bouton "S'assigner"). `null` = non assignee.
+  recruiterId  String?
+  /// Renseigne quand le candidat soumet le formulaire (peut rester `null` s'il n'a pas encore repondu).
+  submittedAt  DateTime?
+  /// Salon ou vit le message de suivi (recap + boutons Statut/S'assigner) : le salon
+  /// `recruitmentLogChannelId` de la guilde au moment de l'envoi, ou le salon du ticket en repli.
+  /// Conserve ici (plutot que relu depuis la config) pour retrouver le bon message meme si
+  /// la config change ensuite.
+  logChannelId String?
+  /// Id du message de suivi, pour pouvoir l'editer en place quand le statut ou le recruteur change.
+  logMessageId String?
+  createdAt    DateTime          @default(now())
+  updatedAt    DateTime          @updatedAt
+
+  ticket      Ticket                  @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  answers     RecruitmentAnswer[]
+  attachments RecruitmentAttachment[]
+}
+
+/// Une reponse du candidat a une question du formulaire de candidature.
+model RecruitmentAnswer {
+  id            String @id @default(cuid())
+  applicationId String
+  /// Libelle de la question (copie du formulaire au moment de la soumission).
+  question      String
+  answer        String
+
+  application RecruitmentApplication @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+}
+
+/// Image envoyee par le candidat directement en message dans le salon du ticket. Les modals
+/// Discord ne supportent pas l'upload de fichier nativement, donc c'est le seul moyen pour le
+/// candidat de joindre des images a sa candidature.
+model RecruitmentAttachment {
+  id            String   @id @default(cuid())
+  applicationId String
+  /// URL publique de l'image : URL CDN en production (`CDN_TOKEN` configure), `null` en dev
+  /// local — les octets vivent alors uniquement sur disque (`data/dev-images/`, cle
+  /// `recruitment-attachments/<id>`, voir `localImageStorage.ts`), jamais en base.
+  imageUrl      String?
+  filename      String
+  /// URL Discord CDN de l'image telle qu'affichee dans le message de suivi, capturee une seule
+  /// fois juste apres l'envoi initial en mode disque local/dev (voir
+  /// `finalizeRecruitmentAttachments`) — reutilisee pour tout rafraichissement ulterieur du
+  /// message (changement de statut, assignation) afin de ne jamais relire le fichier local ni
+  /// introduire une nouvelle reference `attachment://` dans une edition : Discord ne persiste
+  /// pas de facon fiable l'image d'un embed nouvellement ajoute a un message existant via
+  /// `PATCH` (constate en conditions reelles). Inutile en mode CDN : `imageUrl` est deja une
+  /// URL stable et externe, directement reutilisable dans n'importe quelle edition sans ce
+  /// contournement.
+  discordUrl    String?
+  createdAt     DateTime @default(now())
+
+  application RecruitmentApplication @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+}
+
+/// Etapes du pipeline de recrutement, dans l'ordre attendu.
+enum ApplicationStatus {
+  PENDING
+  INTERVIEW
+  ACCEPTED
+  REJECTED
+}
+
+/// Question configurable du formulaire de candidature (panneau "Recrutement" -> "Ajouter une
+/// question"). Si la guilde n'en a configure aucune, le formulaire repli sur 5 questions par
+/// defaut codees en dur (voir `DEFAULT_RECRUITMENT_QUESTIONS` dans `recruitmentQuestionService.ts`).
+/// Max 5 par guilde — meme contrainte Discord que les champs de catalogue (un modal ne peut
+/// afficher que 5 `TextInputComponent` au plus).
+model RecruitmentQuestion {
+  id       String                @id @default(cuid())
+  guildId  String
+  label    String
+  style    RecruitmentFieldStyle
+  /// Ordre d'affichage dans le modal (0 = premiere question).
+  position Int                   @default(0)
+
+  guildConfig GuildConfig @relation(fields: [guildId], references: [guildId])
+
+  @@index([guildId])
+}
+
+enum RecruitmentFieldStyle {
+  SHORT
+  PARAGRAPH
+}
+
+/// Article du catalogue configure par le staff (`/catalog`) : ce que le client peut
+/// commander lui-meme dans un ticket SERVICE. Chaque article peut definir ses propres
+/// champs a remplir par le client (`fields`), pour s'adapter a des produits/services
+/// tres differents (ex: location de salle vs commande de menus).
+model CatalogItem {
+  id            String   @id @default(cuid())
+  guildId       String
+  name          String
+  description   String?
+  /// Prix unitaire, en devise in-game (entier, pas de sous-unite/centimes).
+  price         Int
+  /// URL publique de la photo de l'article : URL CDN en production (`CDN_TOKEN` configure),
+  /// `null` en dev local — les octets vivent alors uniquement sur disque
+  /// (`data/dev-images/`, voir `localImageStorage.ts`), jamais en base.
+  imageUrl      String?
+  /// Nom de fichier associe a la photo (mode disque local ou CDN) ; requis par l'API Discord
+  /// pour le re-upload en mode disque local.
+  imageFilename String?
+  /// Poids unitaire en grammes, optionnel. Si aucun article d'une commande n'a de poids
+  /// configure, "poids total"/"camions requis" sont omis de la facture (voir `orderLogService.ts`).
+  weightGrams   Int?
+  /// Permet de retirer un article du menu deroulant client sans supprimer son historique de commandes.
+  active        Boolean  @default(true)
+  createdAt     DateTime @default(now())
+
+  guildConfig GuildConfig        @relation(fields: [guildId], references: [guildId])
+  fields      CatalogItemField[]
+  orderItems  OrderItem[]
+
+  @@index([guildId, active])
+}
+
+/// Champ personnalise defini par le staff pour un article donne : ce que le client doit
+/// remplir en le commandant (ex: date + nb invites pour une salle, quantite + boisson pour
+/// un menu). Max 5 par article — limite Discord : un modal a au plus 5 TextInputComponent.
+model CatalogItemField {
+  id            String            @id @default(cuid())
+  catalogItemId String
+  label         String
+  style         CatalogFieldStyle
+  required      Boolean           @default(true)
+  /// Ordre d'affichage dans le modal genere dynamiquement (0 = premier champ).
+  position      Int               @default(0)
+
+  catalogItem CatalogItem @relation(fields: [catalogItemId], references: [id], onDelete: Cascade)
+}
+
+/// Style d'un champ personnalise de catalogue. QUANTITY est special : sa reponse alimente
+/// `OrderItem.quantity` (utilise dans le calcul du prix) au lieu d'etre juste stockee comme
+/// reponse libre. Au plus un champ QUANTITY par article (regle verifiee en code, pas en DB).
+enum CatalogFieldStyle {
+  SHORT
+  PARAGRAPH
+  QUANTITY
+}
+
+/// Commande associee a un ticket SERVICE (relation 1:1). Creee des l'ouverture du ticket,
+/// composee ensuite par le client lui-meme (self-service) via le menu deroulant + formulaires
+/// dynamiques ; le staff ne fait que confirmer le paiement, ce qui declenche la facture.
+model ServiceOrder {
+  id                    String        @id @default(cuid())
+  ticketId              String        @unique
+  /// Statut logistique (preparation/livraison), independant du statut de paiement.
+  status                OrderStatus   @default(PENDING)
+  paymentStatus         PaymentStatus @default(UNPAID)
+  /// Numero de facture, genere (et fige) a la premiere generation de facture. `null` tant
+  /// qu'aucune facture n'a jamais ete emise pour cette commande.
+  invoiceNumber         String?       @unique
+  /// Id de l'unique message de commande dans le salon du ticket (recap + boutons), edite en
+  /// place a chaque changement (composition, validation, statut, paiement...) plutot que
+  /// reposte a chaque fois. Toujours dans le salon du ticket (pas de salon de suivi dedie
+  /// pour les commandes, contrairement au recrutement).
+  confirmationMessageId String?
+  /// True une fois que le client a clique "Valider la commande" — determine quel style
+  /// d'embed/boutons afficher sur le message de commande (composition vs suivi/facturation).
+  confirmed             Boolean       @default(false)
+  /// Frais de livraison factures en plus du sous-total des articles, definis manuellement par
+  /// le staff (bouton "Livraison"). 0 = aucun frais.
+  deliveryFee           Int           @default(0)
+  /// Reduction accordee, en pourcentage du sous-total (0-100), definie manuellement par le
+  /// staff (bouton "Réduction"). 0 = aucune reduction. Le montant deduit est recalcule a
+  /// l'affichage (voir `computeGrandTotal`), jamais fige — coherent tant que le sous-total
+  /// n'a pas change depuis, mais recalcule si des articles sont ajoutes/retires ensuite.
+  discountPercent       Int           @default(0)
+  createdAt             DateTime      @default(now())
+  updatedAt             DateTime      @updatedAt
+
+  ticket Ticket      @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  items  OrderItem[]
+}
+
+/// Une ligne de commande. `name`/`unitPrice` sont un instantane (snapshot) de l'article
+/// catalogue au moment de la commande : la facture reste donc correcte meme si le prix ou
+/// le nom de l'article catalogue change plus tard, ou si l'article est supprime
+/// (`catalogItemId` passe alors a `null` via onDelete: SetNull, sans perdre la ligne).
+model OrderItem {
+  id            String  @id @default(cuid())
+  orderId       String
+  catalogItemId String?
+  name          String
+  unitPrice     Int
+  /// Instantane du poids unitaire (grammes) de l'article catalogue au moment de la commande,
+  /// meme raisonnement que `name`/`unitPrice` : la facture reste correcte meme si le poids
+  /// catalogue change ou si l'article est supprime ensuite.
+  weightGrams   Int?
+  quantity      Int     @default(1)
+
+  order       ServiceOrder      @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  catalogItem CatalogItem?      @relation(fields: [catalogItemId], references: [id], onDelete: SetNull)
+  answers     OrderItemAnswer[]
+}
+
+/// Reponse du client a un champ personnalise de l'article commande (hors champ QUANTITY,
+/// qui est stocke directement dans `OrderItem.quantity`). Affichee sur la facture generee.
+model OrderItemAnswer {
+  id          String @id @default(cuid())
+  orderItemId String
+  /// Libelle du champ (copie du `CatalogItemField.label` au moment de la commande).
+  question    String
+  answer      String
+
+  orderItem OrderItem @relation(fields: [orderItemId], references: [id], onDelete: Cascade)
+}
+
+enum OrderStatus {
+  PENDING
+  PREPARING
+  DELIVERED
+  CANCELLED
+}
+
+enum PaymentStatus {
+  UNPAID
+  PAID
+}
+
+/// Message permanent (avec boutons/menus) du panneau d'administration, edite en place a
+/// chaque changement plutot que reposte. Au plus un message par (guildId, key). `enabled`
+/// distingue "jamais active" de "actif" (permet de reactiver plus tard sans perdre la trace
+/// du message).
+model PanelMessage {
+  id        String          @id @default(cuid())
+  guildId   String
+  key       PanelMessageKey
+  /// Id du message dans le salon panneau de la guilde. `null` tant que jamais poste.
+  messageId String?
+  enabled   Boolean         @default(false)
+  createdAt DateTime        @default(now())
+  updatedAt DateTime        @updatedAt
+
+  guildConfig GuildConfig @relation(fields: [guildId], references: [guildId])
+
+  @@unique([guildId, key])
+}
+
+/// Chaque fonctionnalite gerable depuis le panneau. ROOT est le message racine (3 boutons) ;
+/// les autres sont les messages dedies crees quand on active la fonctionnalite correspondante.
+enum PanelMessageKey {
+  ROOT
+  TICKETS
+  SERVICE
+  RECRUITMENT
+  ABSENCES
+  MONITORING
+}
+
+/// Demande d'absence declaree par un membre via le panneau ("Absences" -> "Declarer une
+/// absence"), validee ensuite par le role approbateur configure, dans le salon de suivi
+/// dedie (message edite en place a la resolution — meme principe que le suivi de candidature).
+model AbsenceRequest {
+  id          String        @id @default(cuid())
+  guildId     String
+  requesterId String
+  startDate   DateTime
+  endDate     DateTime
+  reason      String
+  status      AbsenceStatus @default(PENDING)
+  /// Membre du staff ayant accepte/refuse la demande. `null` tant qu'en attente.
+  resolverId  String?
+  resolvedAt  DateTime?
+  /// Salon et message de suivi, memorises au moment de l'envoi (pas relus depuis la config)
+  /// pour retrouver le bon message meme si `absenceReviewChannelId` change ensuite —
+  /// meme raisonnement que `RecruitmentApplication.logChannelId`/`logMessageId`.
+  channelId   String?
+  messageId   String?
+  createdAt   DateTime      @default(now())
+
+  guildConfig GuildConfig @relation(fields: [guildId], references: [guildId])
+
+  @@index([guildId, status])
+}
+
+enum AbsenceStatus {
+  PENDING
+  ACCEPTED
+  REFUSED
+}
+
+/// Salon webhook a surveiller pour un type de log FiveM donne (voir MonitoringLogType). Un
+/// seul salon par type et par guilde — meme simplification que les categories de ticket
+/// (setCategoryForType) : pas de sens metier a en avoir plusieurs pour un meme type.
+model MonitoringChannelConfig {
+  id        String            @id @default(cuid())
+  guildId   String
+  type      MonitoringLogType
+  channelId String
+
+  guildConfig GuildConfig @relation(fields: [guildId], references: [guildId])
+
+  @@unique([guildId, type])
+}
+
+/// Types de logs webhook FiveM surveilles par le monitoring.
+enum MonitoringLogType {
+  /// Prise/fin de service.
+  SHIFT
+  /// Embauche/licenciement/changement de grade.
+  RECRUITMENT
+  /// Depot/retrait dans un coffre d'entreprise.
+  SAFE
+  /// Paiement de facture.
+  INVOICE
+  /// Vente de ressource.
+  SALE
+}
+
+/// Journal brut de chaque log de monitoring ingere (apres filtrage par jobId). Sert (a)
+/// d'audit/rejeu si un parsing specifique echoue ou evolue, (b) de source pour les stats
+/// (factures/ventes), (c) de payload pour le webhook sortant correspondant (voir
+/// webhookDispatcher.ts, evenements "monitoring.*").
+model MonitoringEvent {
+  id        String            @id @default(cuid())
+  guildId   String
+  type      MonitoringLogType
+  /// Champs bruts de l'embed + resultat du parsing specifique au type (direction, montant,
+  /// quantite...), fusionnes dans un seul objet. Volume attendu trop faible pour justifier
+  /// des colonnes dediees/agregation cote DB : les stats sont calculees en memoire a la demande.
+  rawFields Json
+  createdAt DateTime          @default(now())
+
+  guildConfig GuildConfig @relation(fields: [guildId], references: [guildId])
+
+  @@index([guildId, type, createdAt])
+}
+
+/// Un coffre physique d'entreprise, identifie par la position stable du coffre lui-meme
+/// (`targetPosition` du log SAFE, pas `position` qui est celle du joueur au moment de
+/// l'action). Assomption a verifier en conditions reelles : le meme coffre physique emet-il
+/// toujours exactement la meme `targetPosition` ?
+model MonitoringSafe {
+  id          String @id @default(cuid())
+  guildId     String
+  positionKey String
+
+  guildConfig GuildConfig              @relation(fields: [guildId], references: [guildId])
+  movements   MonitoringSafeMovement[]
+
+  @@unique([guildId, positionKey])
+}
+
+/// Un mouvement (depot ou retrait) sur un coffre. Le stock courant = somme des `quantity`
+/// groupee par (safeId, itemId) — ledger append-only plutot qu'un compteur mutable, pour
+/// garder l'historique complet et pouvoir recalculer/auditer.
+model MonitoringSafeMovement {
+  id              String   @id @default(cuid())
+  safeId          String
+  itemId          String
+  /// Positif = depot, negatif = retrait.
+  quantity        Int
+  playerDiscordId String?
+  playerName      String?
+  createdAt       DateTime @default(now())
+
+  safe MonitoringSafe @relation(fields: [safeId], references: [id], onDelete: Cascade)
+
+  @@index([safeId, itemId])
 }

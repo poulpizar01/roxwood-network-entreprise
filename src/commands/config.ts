@@ -1,7 +1,15 @@
 import { PermissionFlagsBits, SlashCommandBuilder, ChannelType } from "discord.js";
 import type { Command } from "./types.js";
-import { addTicketCategory, addStaffRole, setEscalationMinutes } from "../services/guildConfigService.js";
+import { setPanelChannel } from "../services/guildConfigService.js";
+import { refreshRootPanelMessage } from "../services/panelService.js";
 
+/**
+ * `/config` : commande d'administration (reservee `ManageGuild`). La majorite des reglages
+ * (categories de tickets, roles de gestion, catalogue, recrutement...) se font desormais via
+ * le panneau par boutons (voir `panelService.ts`, `interactionCreate.ts` prefixe `panel:`) —
+ * `set-panel-channel` designe justement le salon qui l'accueille. Seuls les reglages pas
+ * encore migres vers le panneau restent des commandes slash pour cette phase.
+ */
 export const configCommand: Command = {
   data: new SlashCommandBuilder()
     .setName("config")
@@ -9,31 +17,13 @@ export const configCommand: Command = {
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .addSubcommand((sub) =>
       sub
-        .setName("set-ticket-category")
-        .setDescription("Ajouter une categorie surveillee comme categorie de tickets")
+        .setName("set-panel-channel")
+        .setDescription("Salon qui accueille le panneau d'administration par boutons")
         .addChannelOption((opt) =>
           opt
-            .setName("category")
-            .setDescription("Categorie Discord utilisee par Ticket Tool")
-            .addChannelTypes(ChannelType.GuildCategory)
-            .setRequired(true)
-        )
-    )
-    .addSubcommand((sub) =>
-      sub
-        .setName("set-staff-role")
-        .setDescription("Ajouter un role considere comme staff de support")
-        .addRoleOption((opt) => opt.setName("role").setDescription("Role staff").setRequired(true))
-    )
-    .addSubcommand((sub) =>
-      sub
-        .setName("set-escalation-timeout")
-        .setDescription("Delai (minutes) avant escalade d'un ticket sans reponse staff")
-        .addIntegerOption((opt) =>
-          opt
-            .setName("minutes")
-            .setDescription("0 pour desactiver l'escalade")
-            .setMinValue(0)
+            .setName("channel")
+            .setDescription("Salon du panneau")
+            .addChannelTypes(ChannelType.GuildText)
             .setRequired(true)
         )
     ) as SlashCommandBuilder,
@@ -42,27 +32,11 @@ export const configCommand: Command = {
     if (!interaction.inGuild()) return;
     const sub = interaction.options.getSubcommand();
 
-    if (sub === "set-ticket-category") {
-      const category = interaction.options.getChannel("category", true);
-      await addTicketCategory(interaction.guildId, category.id);
-      await interaction.reply({ content: `Categorie de tickets ajoutee : <#${category.id}>`, ephemeral: true });
-      return;
-    }
-
-    if (sub === "set-staff-role") {
-      const role = interaction.options.getRole("role", true);
-      await addStaffRole(interaction.guildId, role.id);
-      await interaction.reply({ content: `Role staff ajoute : <@&${role.id}>`, ephemeral: true });
-      return;
-    }
-
-    if (sub === "set-escalation-timeout") {
-      const minutes = interaction.options.getInteger("minutes", true);
-      await setEscalationMinutes(interaction.guildId, minutes === 0 ? null : minutes);
-      await interaction.reply({
-        content: minutes === 0 ? "Escalade desactivee." : `Escalade fixee a ${minutes} min sans reponse staff.`,
-        ephemeral: true,
-      });
+    if (sub === "set-panel-channel") {
+      const channel = interaction.options.getChannel("channel", true);
+      await setPanelChannel(interaction.guildId, channel.id);
+      await refreshRootPanelMessage(interaction.client, interaction.guildId, channel.id);
+      await interaction.reply({ content: `Panneau d'administration installé dans <#${channel.id}>.`, ephemeral: true });
     }
   },
 };

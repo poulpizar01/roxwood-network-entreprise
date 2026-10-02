@@ -1,49 +1,156 @@
-# Sur-couche Ticket Tool
+# Roxwood Network Entreprise
 
-Bot Discord (Node.js + TypeScript + discord.js + Prisma/PostgreSQL) qui observe les tickets crees par Ticket Tool et ajoute : priorites/tags, escalade automatique, reponses automatiques par mot-cle, et des webhooks sortants pour brancher des systemes externes.
+Bot Discord (Node.js + TypeScript + discord.js + Prisma/PostgreSQL) qui ajoute une sur-couche à Ticket Tool pour des serveurs GTA RP, sur deux usages :
 
-Ticket Tool n'a pas d'API publique : la detection se fait en ecoutant les evenements Discord (creation/suppression/renommage de canal dans la categorie configuree).
+- **Recrutement** : formulaire de candidature (bouton -> modal) rempli par le candidat dès l'ouverture du ticket, suivi piloté par le staff via des boutons (pas de commande à taper) dans un salon de suivi dédié.
+- **Service client** : catalogue de produits/services (photo + champs personnalisés par article, configuré par le staff), commande composée **par le client lui-même** (menu déroulant + formulaire), le staff n'a qu'à confirmer le paiement — ce qui génère automatiquement une facture (embed Discord).
 
-## Demarrage (dev local)
+Plus les fonctions génériques de la base : demandes d'absence, webhooks sortants pour brancher des systèmes externes.
+
+Ticket Tool n'a pas d'API publique : la détection se fait en écoutant les événements Discord (création/suppression/renommage de canal dans la catégorie configurée, associée à un type Recrutement ou Service via le **panneau d'administration**, voir plus bas).
+
+**Quasiment toute la configuration passe par le panneau d'administration** (messages permanents avec boutons, édités en place) plutôt que par des commandes slash — beaucoup plus intuitif que de devoir connaître/taper des commandes. Il ne reste que quelques commandes slash pour ce qui n'a pas encore rejoint le panneau, plus `/absence` qui est volontairement une commande (accessible à tout le monde, pas un bouton dans un salon potentiellement invisible aux non-staff).
+
+## Secrets : qui a accès à quoi
+
+Le token du bot de **production** (celui utilisé sur le vrai serveur Discord) vit uniquement dans le `.env` du VPS, configuré par la personne qui a accès au VPS. Il n'est jamais commité, jamais partagé sur GitHub, et les contributeurs qui n'ont accès qu'au repo n'y ont pas accès.
+
+Pour développer/tester en local sans ce token, créer une application Discord **personnelle et séparée** sur https://discord.com/developers/applications (gratuit) :
+1. New Application → Bot → copier le token → c'est ton `DISCORD_TOKEN` de dev local.
+2. Récupérer le Client ID dans "General Information" → `CLIENT_ID`.
+3. Inviter ce bot de test sur un serveur Discord perso (le tien, ou un serveur de test) via l'URL d'invitation OAuth2 générée dans le portail, avec un vrai Ticket Tool installé dessus pour tester la détection.
+
+## Démarrage (dev local)
 
 1. `npm install`
-2. Copier `.env.example` en `.env` et renseigner `DISCORD_TOKEN`, `CLIENT_ID`, `DATABASE_URL` (et `DEV_GUILD_ID` en dev pour un enregistrement instantane des commandes slash).
-3. `npx prisma migrate dev` pour creer le schema PostgreSQL.
+2. Copier `.env.example` en `.env` et renseigner `DISCORD_TOKEN`/`CLIENT_ID` (ton bot de test personnel, voir ci-dessus), `DATABASE_URL` (et `DEV_GUILD_ID` en dev pour un enregistrement instantané des commandes slash).
+3. `npx prisma migrate dev` pour créer le schéma PostgreSQL.
 4. `npm run dev` pour lancer le bot.
 
-## Deploiement VPS (Docker)
+## Déploiement VPS (Docker)
 
 Le bot tourne en production via `docker-compose.yml` (2 services : `bot` et `db` Postgres). Sur le VPS :
 
 1. `git clone` puis `cd` dans le repo.
-2. Creer un fichier `.env` (jamais commite) avec au minimum : `DISCORD_TOKEN`, `CLIENT_ID`, `POSTGRES_PASSWORD` (mot de passe dedie, different du dev local). Voir `.env.example` pour la liste complete des variables Docker.
+2. Créer un fichier `.env` (jamais commité) avec au minimum : `DISCORD_TOKEN`, `CLIENT_ID`, `POSTGRES_PASSWORD` (mot de passe dédié, différent du dev local). Voir `.env.example` pour la liste complète des variables Docker.
 3. `docker compose up -d --build`
 
-Au demarrage du conteneur `bot`, `docker/entrypoint.sh` applique automatiquement les migrations Prisma (`prisma migrate deploy`) avant de lancer le bot — aucune commande manuelle a lancer sur le VPS pour les migrations.
+Au démarrage du conteneur `bot`, `docker/entrypoint.sh` applique automatiquement les migrations Prisma (`prisma migrate deploy`) avant de lancer le bot — aucune commande manuelle à lancer sur le VPS pour les migrations.
 
-Pour mettre a jour apres un push sur GitHub : sur le VPS, `git pull` puis `docker compose up -d --build`.
+Pour mettre à jour après un push sur GitHub : sur le VPS, `git pull` puis `docker compose up -d --build`.
 
-Aucun port n'est expose publiquement (le bot ne fait que des connexions sortantes vers Discord et les webhooks configures) ; Postgres n'est accessible que depuis le reseau Docker interne.
+Aucun port n'est exposé publiquement (le bot ne fait que des connexions sortantes vers Discord et les webhooks configurés) ; Postgres n'est accessible que depuis le réseau Docker interne.
 
-## Configuration sur un serveur
+## Panneau d'administration
 
-- `/config set-ticket-category` : indique quelle categorie Discord Ticket Tool utilise pour ouvrir les tickets.
-- `/config set-staff-role` : role(s) considere(s) comme staff (pour le temps de premiere reponse et les pings d'escalade).
-- `/config set-escalation-timeout` : delai en minutes avant qu'un ticket sans reponse staff declenche une escalade (0 = desactive).
+`/config set-panel-channel <channel>` désigne un salon (staff/admin uniquement côté permissions Discord) qui accueille le **message racine** du panneau : 3 boutons, **Tickets**, **Absences**, **Monitoring**. Cliquer un bouton active la fonctionnalité et poste (ou met à jour) un **message dédié** dans le même salon, édité en place à chaque changement plutôt que reposté.
 
-## Commandes disponibles
+Techniquement, chaque message dédié est identifié en base par une clé fixe (`PanelMessage`, une ligne par `(guildId, clé)`) qui mémorise l'id du message Discord correspondant — c'est ce qui permet de l'éditer en place plutôt que d'en reposter un nouveau à chaque changement de configuration. Au démarrage du bot (`ready.ts`), **tous les messages dédiés existants sont reconstruits depuis le code courant** (`refreshAllPanelsAcrossGuilds`) : une mise à jour du bot (nouveau champ, nouveau bouton, libellé corrigé...) se propage donc automatiquement à ce qui est déjà posté dans Discord, sans qu'un admin ait besoin de reconfigurer quoi que ce soit ou de perdre sa config en cours de route.
 
-- `/ticket info` — resume du ticket courant (statut, priorite, tags, opener).
-- `/ticket priority <level>` — LOW / NORMAL / HIGH / URGENT.
-- `/ticket tag add|remove <tag>`.
-- `/autoreply add|remove|list` — regles de reponse automatique mot-cle.
-- `/stats overview` — tickets ouverts/fermes/escalades, temps de reponse moyen.
+- **Tickets** : bouton "Définir les rôles de gestion" — sélection multiple native Discord (jusqu'à 25 rôles à la fois), pré-remplie avec les rôles déjà assignés à la catégorie choisie ; valider remplace l'ensemble complet en un seul geste (chaque catégorie de ticket a sa propre équipe, il n'y a plus de rôle staff global unique). Le message porte aussi deux boutons qui ouvrent les messages dédiés imbriqués **Service client** et **Recrutement** (dans le même salon).
+- **Service client** : bouton "Définir/Retirer la catégorie" (libellé selon l'état courant), puis gestion du catalogue — ajouter/retirer un article, changer sa photo (envoyée en message juste après, les modals Discord ne supportent pas l'upload de fichier — voir plus bas comment cette photo est ensuite stockée), définir le poids unitaire d'un article, ajouter/retirer un champ personnalisé par article. Section "Configurer la boutique" pour le profil affiché sur les factures (voir section Service client plus bas).
+- **Recrutement** : bouton "Définir/Retirer la catégorie", bouton "Ouvrir/Fermer les recrutements" (même principe, libellé dynamique) accolé au bouton "Définir/Retirer le salon de statut" (message public qui affiche l'état ouvert/fermé, voir plus bas), bouton "Définir/Retirer le salon de suivi" des candidatures ("Retirer" revient au comportement par défaut : récap posté dans le salon du ticket), boutons "Définir/Retirer la catégorie d'acceptation" et "Définir/Retirer le rôle d'acceptation" (effets automatiques à l'acceptation, voir plus bas), et gestion des questions du formulaire de candidature (max 5, style texte court/long) — si aucune n'est configurée, repli automatique sur 5 questions par défaut (Nom RP, Âge, Expérience RP, Disponibilités, Motivation).
+- **Absences** : bouton "Définir les rôles approbateurs" (même sélection multiple que Tickets) et bouton "Définir/Retirer le salon de suivi".
+- **Monitoring** : lecture des logs webhook du script FiveM (voir section Monitoring plus bas) — c'est aussi ici, et uniquement ici, que se gèrent **tous** les abonnements webhook sortants du bot, quel que soit leur domaine (Monitoring, Absences, Service client).
+
+Chaque message dédié (sauf le message racine) porte une réaction 🗑️ posée automatiquement : cliquer dessus le supprime et réinitialise sa référence en base — recliquer le bouton parent (racine, ou "Tickets" pour Service/Recrutement) le reposte tout neuf. Le message racine n'a jamais cette réaction : c'est le seul point d'entrée vers tout le reste, il ne doit pas pouvoir être supprimé par erreur.
+
+## Commandes slash restantes
+
+- `/config set-panel-channel <channel>` — salon du panneau d'administration (voir ci-dessus).
+- `/absence` — déclare une absence (accessible à tout le monde, voir section Absences).
+- `/stats overview` — tickets ouverts/fermés, temps de réponse moyen.
+
+## Recrutement
+
+À l'ouverture d'un ticket dans la catégorie Recrutement (et si les recrutements sont ouverts, voir panneau "Recrutement"), le bot poste un bouton "Remplir le formulaire" qui ouvre un modal Discord avec les questions configurées (ou les 5 par défaut). Le bouton reste affiché après usage, mais une resoumission est refusée côté serveur (`submittedAt` déjà renseigné) : un re-clic répond juste "déjà soumis" plutôt que de dupliquer les réponses. À la soumission, le candidat reçoit une confirmation avec un bouton "J'ai terminé d'envoyer mes fichiers" : il peut envoyer d'éventuelles photos/documents **directement en message** dans le salon, puis cliquer ce bouton une fois terminé — le bot parcourt alors l'historique du salon depuis la soumission du formulaire (par pages de 100 messages, jusqu'à 500 messages), retient ses fichiers (3 max, 8 Mo max chacun) et les charge **en une seule fois** sur la candidature (`finalizeRecruitmentAttachments`, `recruitmentLogService.ts`). Choix délibéré : un chargement incrémental à chaque message obligerait à éditer le message de suivi à chaque nouveau fichier, or Discord ne persiste pas de façon fiable l'image d'un embed nouvellement ajouté à un message existant via `PATCH` (constaté en conditions réelles — la réponse de l'appel affichait l'image, une relecture immédiate du message ne la montrait plus). Le message de suivi existant (texte seul jusque-là) est donc supprimé puis reposté intégralement avec les images cette fois, en un seul `POST` — la seule méthode fiable. Un second clic sur le bouton après un premier succès est un no-op ("déjà enregistrés").
+
+Un récap (candidat, statut, recruteur, réponses, pièces jointes) est posté dans le salon de suivi (panneau "Recrutement" → "Définir le salon de suivi", ou le salon du ticket par défaut) avec deux boutons :
+
+- **Statut** — ouvre un menu déroulant éphémère (En attente / Entretien / Accepté / Refusé) ; le message de suivi se met à jour automatiquement. Passer une candidature à **Refusé** marque aussi le ticket comme clôturé côté suivi (sort des stats "ouverts") et prévient le staff dans le salon qu'il peut le fermer via le bouton "Close" de Ticket Tool. La fermeture automatisée a été testée (message direct du bot, puis via webhook de salon) et abandonnée : Ticket Tool ignore tout message qui ne vient pas d'un vrai humain, et un bot ne peut de toute façon pas cliquer le bouton d'un autre bot à sa place (limite Discord). C'est pour ça que le bot ne supprime jamais les messages d'un autre bot qui portent un bouton/menu (voir plus bas) : celui de Ticket Tool doit rester cliquable.
+- **S'assigner** — assigne directement le membre du staff qui clique comme recruteur (réassignation possible).
+
+Ces boutons (et ceux du panneau "Tickets"/"Service client"/"Recrutement") sont réservés aux rôles de gestion de la catégorie concernée (panneau "Tickets" → "Définir les rôles de gestion") : un clic par quelqu'un d'autre est refusé avec un message explicite.
+
+Un webhook sortant `recruitment.updated` existe aussi (`recruitmentService.ts`), envoyé à la soumission du formulaire puis à chaque changement de statut, assignation ou nouvelle pièce jointe, avec l'état complet de la candidature à chaque fois (candidat, statut, recruteur, réponses, noms des pièces jointes — jamais leurs octets, le JSON n'est pas fait pour transporter du binaire) — même principe que `absence.updated`/`order.updated`, un seul type d'événement à écouter côté site. À ne pas confondre avec `monitoring.recruitment` : celui-ci relaie les logs FiveM d'embauche/licenciement en jeu, pas les données du formulaire Discord. Se configure depuis le panneau "Monitoring" comme tous les autres webhooks.
+
+Passer une candidature à **Accepté** (manuellement via "Statut", ou automatiquement via le log Monitoring "embauche", voir plus bas) déclenche deux effets optionnels, indépendants l'un de l'autre et configurés une fois pour toute la guilde (panneau "Recrutement") : déplacer le salon du ticket vers une catégorie Discord dédiée, et ajouter un rôle au candidat. Chacun échoue silencieusement (juste loggé côté bot) s'il n'est pas configuré, ou si le bot n'a pas la permission Discord nécessaire (Gérer les salons / Gérer les rôles) — l'acceptation elle-même n'est jamais bloquée par un effet secondaire manqué.
+
+Le panneau "Recrutement" permet aussi de désigner un **salon de statut public** (bouton "Définir le salon de statut", distinct du salon de suivi réservé au staff) : un message permanent y affiche "Recrutements ouverts"/"Recrutements fermés", édité en place à chaque bascule du bouton "Ouvrir/Fermer les recrutements" — pratique pour un salon visible de tous sans dépendre du panneau d'administration lui-même.
+
+Le bot supprime aussi automatiquement, dans tout ticket suivi, les messages purement informatifs postés par d'autres bots pour garder le salon propre — mais jamais un message qui porte un bouton ou un menu (typiquement le message de bienvenue de Ticket Tool avec son bouton "Close"), pour ne pas priver le staff de sa seule vraie méthode de fermeture. Nécessite que le rôle du bot ait la permission Discord **"Gérer les messages"** sur le serveur ; sans elle, la suppression échoue silencieusement (juste loggée).
+
+## Service client (catalogue + commande self-service)
+
+Le staff configure le catalogue via le panneau "Service client", le **client compose sa commande lui-même** dans le ticket, et un seul message de commande est édité en place tout au long du cycle (composition → validation → suivi) plutôt que reposté à chaque fois :
+
+1. Panneau "Service client" → "Ajouter un article" (modal nom/prix/description) → "Changer la photo d'un article" (envoyée en message juste après, les modals ne supportent pas l'upload) → "Définir le poids d'un article" (optionnel, en grammes — voir "poids total"/"camions requis" plus bas).
+2. "Ajouter un champ" — jusqu'à 5 champs par article, à remplir par le client lors de la commande (ex: date + nombre d'invités pour une salle, quantité + boisson pour un menu). Le style `Quantité` alimente automatiquement le calcul du prix ; les autres styles (`Texte court`/`Texte long`) sont juste enregistrés et affichés sur la facture.
+3. À l'ouverture d'un ticket Service, le bot poste un menu déroulant du catalogue actif (chaque option affiche le prix et le début de la description, tronqués à 100 caractères — limite Discord). Le client choisit un article -> un embed de confirmation s'affiche (nom, description complète, prix, photo) -> "Continuer" ouvre le formulaire généré à partir des champs configurés -> il peut ajouter d'autres articles -> "Valider la commande" ping les rôles de gestion de la catégorie. L'étape de confirmation existe uniquement parce que Discord interdit d'afficher un embed et un modal en réponse à la même interaction : c'est le seul moyen de montrer la photo avant que le client ne s'engage.
+4. Côté staff, directement sur le message de commande : **Statut** (menu déroulant), **Marquer payée** (bascule le paiement et **génère/poste automatiquement la facture**), **Facture** (renvoie la facture sans changer le paiement), **Livraison**/**Réduction** (modals — montant fixe pour la livraison, pourcentage du sous-total pour la réduction, tous deux reflétés dans le total affiché sur le message de commande), **Ajouter un article** (réutilise le menu du client), **Retirer un article** (menu des lignes existantes) — pour des corrections manuelles exceptionnelles. Boutons réservés aux rôles de gestion de la catégorie.
+
+La facture est un **embed Discord** (pas une image générée) : articles, sous-total, livraison, réduction et total, plus deux blocs optionnels qui n'apparaissent que si l'information existe — **poids total et nombre de camions requis** (uniquement si au moins un article de la commande a un poids configuré et qu'une capacité de camion est définie côté boutique, sinon ces deux champs sont simplement omis plutôt que d'afficher une valeur trompeuse) et le **profil boutique** (RIB, téléphone, message de remerciement, bannière — panneau "Service client" → "Configurer la boutique"/"Définir la bannière", configuré une fois pour toute la guilde plutôt que ressaisi à chaque facture). Le numéro de facture est un **compteur séquentiel propre à chaque guilde** (`1`, `2`, `3`...), pas une chaîne aléatoire — incrémenté atomiquement (`GuildConfig.lastInvoiceNumber`), sans risque de doublon même si deux factures sont générées au même instant.
+
+Un webhook sortant `order.updated` existe aussi, envoyé à la validation de la commande par le client puis à chaque (re)génération de facture, avec l'état complet de la commande (articles, sous-total, livraison, réduction, total, statut de paiement, numéro de facture) — de quoi laisser un site externe générer sa propre facture sans dépendre du rendu Discord. Il se configure depuis le panneau "Monitoring" (voir plus bas), pas ici : tous les abonnements webhook du bot sont centralisés à un seul endroit, quel que soit le domaine de l'événement.
+
+**Stockage des images (photo d'article, bannière, pièces jointes de candidature)** : les modals Discord ne supportant pas l'upload de fichier, la photo/bannière est envoyée en message classique dans le salon panneau juste après le clic sur le bouton correspondant (et pour une candidature, le candidat l'envoie directement dans son ticket, voir plus haut). Seules les images sont acceptées (png/jpg/webp, pas de gif, 8 Mo max), vérifié avant tout téléchargement. Le bot télécharge ensuite les octets plutôt que de garder l'URL du message Discord — cette URL cesse de répondre (404) dès que son message est supprimé, même avant l'expiration normale du lien signé (constaté en conditions réelles) — puis les stocke selon l'environnement : sur un **CDN externe** (`https://storage.fbfa.fr`) si `CDN_TOKEN` est configuré (production), auquel cas seule l'URL publique renvoyée est gardée (`CatalogItem.imageUrl`/`GuildConfig.shopBannerUrl`/`RecruitmentAttachment.imageUrl`) ; sinon (dev local) sur **disque**, sous `data/dev-images/` (jamais commité, jamais en base) — le schéma Postgres ne porte ainsi aucune colonne propre au dev local. En possédant le fichier, le bot peut supprimer le message d'upload tout de suite après (catalogue/bannière ; les pièces jointes de candidature restent dans le fil, elles ne sont pas auto-supprimées). Pour le catalogue/la facture, l'image est réaffichée à chaque fois qu'un embed en a besoin (URL directe en CDN, ré-upload `attachment://<nom>` depuis le disque en dev). Pour une candidature, l'upload ne se fait qu'**une seule fois** (voir plus haut, `finalizeRecruitmentAttachments`) : en CDN, l'URL déjà stable suffit à toute édition ultérieure ; en dev local, l'URL Discord CDN obtenue lors de cet unique envoi est capturée dans `RecruitmentAttachment.discordUrl` et réutilisée pour tout rafraîchissement ultérieur du récap, sans jamais retoucher aux pièces jointes du message.
+
+## Absences
+
+Panneau "Absences" → configurer les **rôles approbateurs** (sélection multiple, plusieurs paliers de management possibles — n'importe lequel de ces rôles peut traiter une demande) et le **salon de suivi** (séparé du salon panneau). Une fois les deux définis, n'importe quel membre peut déclarer une absence avec `/absence` (dates JJ/MM/AAAA + motif). La demande est postée dans le salon de suivi avec deux boutons **Accepter**/**Refuser**, réservés aux rôles approbateurs ; le message se met à jour en place (statut, qui a traité) une fois résolue.
+
+Un webhook sortant `absence.updated` existe aussi, envoyé à la fois à la déclaration et à la résolution (acceptation/refus) avec l'état complet de la demande à chaque fois (statut, dates, motif, qui a traité) — un seul type d'événement à écouter côté site pour reconstruire un planning, plutôt que deux événements distincts à recomposer soi-même. Il se configure depuis le panneau "Monitoring" (voir plus bas), pas ici.
+
+## Monitoring (logs webhook FiveM)
+
+Le script FiveM du serveur poste des logs d'activité en jeu (embeds webhook) dans des salons dédiés : prise/fin de service, recrutements/licenciements, mouvements de coffre d'entreprise, factures, ventes. Le panneau "Monitoring" configure :
+
+- **Entreprise (jobId)** : chaque guilde ne surveille qu'**une seule entreprise** — tout log dont le `jobId` ne correspond pas est complètement ignoré (le serveur FiveM mélange plusieurs entreprises dans les mêmes salons).
+- **Rôle "en service"** : ajouté au membre à la prise de service, retiré à la fin de service.
+- **Un salon par type de log** (Prise de service / Recrutement / Coffre / Facture / Vente run) : bouton "Salon <type>" (libellé dynamique Définir/Retirer selon l'état courant).
+- **Webhooks sortants** — **point unique de gestion pour tout le bot**, pas seulement les événements `monitoring.*` : "Ajouter un webhook" propose les types intégrés (5 `monitoring.*`, `absence.updated`, `order.updated`) ainsi qu'un type **`custom`**, choisir le type puis l'URL de destination génère un secret affiché **une seule fois**, à noter pour vérifier la signature HMAC-SHA256 (header `X-Signature-256`) côté récepteur. Centralisé ici plutôt que dispersé sur chaque panneau concerné, à la demande explicite de l'utilisateur.
+- **Livraison avec nouvelles tentatives** (`WebhookDeliveryAttempt`, `webhookDispatcher.ts`) : un premier essai est toujours envoyé immédiatement ; s'il échoue pour une raison jugée transitoire (erreur réseau/timeout, HTTP 5xx ou 429), la livraison est mise en file et réessayée toutes les minutes avec un backoff exponentiel (1, 2, 4... jusqu'à 30 min plafond), jusqu'à 10 tentatives avant abandon définitif (journalisé en erreur). Un échec HTTP 4xx (401, 404...) n'est **volontairement pas** réessayé : la même requête signée obtiendrait la même réponse à chaque fois, ça ne ferait que retarder le diagnostic d'un vrai problème de configuration (secret non reconnu, mauvaise URL). `startWebhookRetryPolling()` démarre le sondage au boot (voir `ready.ts`), même pattern que le sondage des Google Sheets.
+- **Webhooks `custom`** : contrairement aux autres types, jamais déclenchés automatiquement par un événement du bot — chaque abonnement `custom` porte un `label` libre choisi à la création (ex: "Ventes formation", "Villas") pour pouvoir en créer plusieurs, chacun pointant vers un récepteur différent (typiquement un Google Sheet ou équivalent, un par tableau). Le bot ne connaît ni n'impose aucun schéma : c'est au récepteur d'interpréter le contenu comme il l'entend, un abonnement peut recevoir un objet complètement différent du suivant. Alimenté exclusivement par une synchronisation Google Sheet (voir ci-dessous) — chaque envoi cible un seul abonnement à la fois (`dispatchCustomWebhook`, par id), jamais un fan-out par type comme les autres événements, pour ne pas faire recevoir aux autres feuilles un contenu qui ne les concerne pas.
+- **Synchronisation Google Sheets → webhook `custom`** (`src/services/sheetSyncService.ts`) : "Synchroniser un Google Sheet" lie un abonnement `custom` existant à un Sheet — le bot sonde son export CSV public toutes les 5 minutes et transmet automatiquement chaque nouvelle ligne (celles ajoutées depuis le dernier sondage) à l'abonnement, la première ligne du Sheet servant d'en-têtes. Choix explicite : lecture via l'export CSV public (le Sheet doit être partagé "Lecture" pour "Toute personne avec le lien") plutôt qu'un compte de service Google, pour ne demander aucun identifiant à stocker côté VPS — le lien du Sheet devient alors lui-même une donnée sensible (équivalent à un secret), à ne pas partager publiquement. Un lien de partage classique (avec ou sans `#gid=`) est accepté tel quel et normalisé en URL d'export (`parseGoogleSheetUrl`). À la création, tout l'historique déjà présent dans le Sheet est envoyé immédiatement (une ligne = un envoi) ; ensuite, seules les lignes ajoutées depuis le dernier sondage sont transmises (`lastRowCount`, mis à jour après chaque envoi). L'hypothèse est que les nouvelles lignes sont ajoutées en fin de tableau (usage normal d'un journal) — si des lignes sont supprimées entre deux sondages, le compteur se recale sur le nombre actuel plutôt que de rester bloqué.
+
+Effets automatiques :
+- **Prise de service** : bascule le rôle "en service" du membre concerné.
+- **Recrutement** (embauche uniquement) : si un ticket de candidature existe pour ce joueur (`Ticket.openerId` = `targetPlayerDiscord` du log), passe son statut à **Accepté** et met à jour le message de suivi. Licenciements et changements de grade sont journalisés mais sans effet automatique pour l'instant.
+- **Coffre** : chaque dépôt/retrait alimente un ledger par coffre (identifié par sa position) — consultable uniquement via le webhook sortant `monitoring.storage`, volontairement sans commande Discord équivalente (donnée d'entreprise sensible, réservée à un site externe protégé par sa propre authentification plutôt qu'accessible à quiconque voit le salon panneau). Le payload porte à la fois le mouvement ponctuel (`parsed.direction`/`quantity`) et le niveau de stock résultant de cet item dans ce coffre (`parsed.stockAfter`) : pas besoin de sommer soi-même l'historique des mouvements côté récepteur pour connaître le stock courant.
+- **Facture / Vente run** : journalisés pour les statistiques (montant, taxes, quantités) et relayés par webhook sortant — aucun effet automatique.
+
+Tout log reçu (que le texte libre de sa description ait pu être parsé ou non) est conservé en base (`MonitoringEvent`) et jamais perdu — un format de description inattendu désactive juste l'effet automatique correspondant (avertissement loggé), le reste continue de fonctionner.
+
+**Purge automatique** (`src/services/retentionService.ts`) : les `MonitoringEvent` de plus de 90 jours et les pièces jointes de candidature (`RecruitmentAttachment`) rattachées à un ticket **fermé** depuis plus de 30 jours sont supprimés automatiquement, une fois au démarrage puis toutes les 24h. Les candidatures **acceptées** ne sont jamais concernées tant que leur salon reste ouvert (déplacé vers une autre catégorie plutôt que supprimé à l'acceptation) : leurs pièces jointes sont conservées indéfiniment, seules les candidatures refusées (marquées closes immédiatement) ou les tickets réellement fermés entrent dans la fenêtre des 30 jours. Le ledger de coffre (`MonitoringSafeMovement`) n'est volontairement pas concerné : le stock courant est calculé en sommant l'historique, en purger supprimerait des mouvements sans figer de solde de report.
+
+### Sécurité des webhooks sortants
+
+C'est du **push sortant uniquement** : le bot envoie un `POST` vers l'URL configurée dès qu'un événement se produit, sans qu'aucun utilisateur ne soit connecté à ce moment-là — communication bot-vers-serveur, aucun port/serveur exposé côté bot. Le corps envoyé est `{ guildId, eventType, payload, sentAt }` ; `guildId` identifie explicitement de quel serveur Discord provient l'événement (utile si le récepteur reçoit plusieurs Discords sur une seule URL). L'isolation entre serveurs Discord est garantie côté code : `dispatchWebhook` ne va chercher que les abonnements de la guilde concernée, jamais ceux d'un autre serveur.
+
+**Cette route n'est qu'un tuyau d'ingestion, jamais une route de lecture** : appeler cette URL directement (avec ou sans la bonne signature) ne renvoie jamais les données déjà stockées, elle ne fait qu'accepter (ou rejeter) ce qu'on lui envoie. Consulter les données doit se faire ailleurs, sur des pages du site protégées par une authentification à part (ex: OAuth2 Discord pour vérifier qui est connecté et quels rôles il a) — sans lien technique avec cette URL.
+
+**Vérification côté récepteur (obligatoire, pas automatique)** : chaque requête porte un header `X-Signature-256` = HMAC-SHA256 du corps brut, signé avec le secret propre à l'abonnement (généré et affiché **une seule fois** lors du clic sur "Ajouter un webhook" dans le panneau "Monitoring" — à copier immédiatement dans la config du site). Le bot ne peut pas forcer cette vérification, elle doit être implémentée côté site :
+1. Récupérer le corps brut de la requête (avant tout parsing JSON — un corps re-sérialisé peut ne plus correspondre octet pour octet).
+2. Recalculer HMAC-SHA256(secret, corps brut).
+3. Comparer au header `X-Signature-256` en temps constant (`crypto.timingSafeEqual` en Node, ou équivalent).
+4. Rejeter (401/403) si absent ou différent.
+
+Sans ça, n'importe qui connaissant l'URL peut injecter de fausses données (pas lire les vraies, voir plus haut) — même principe que les webhooks Stripe/GitHub.
+
+**Le secret doit rester côté serveur du site uniquement** (variable d'environnement, jamais dans du code envoyé au navigateur, jamais commité sur un dépôt public) — sinon n'importe quel visiteur du site pourrait le récupérer et signer de fausses requêtes lui-même. En cas de doute sur une fuite, retirer l'abonnement puis en recréer un (nouveau secret, l'ancien devient inutile).
+
+Les actions sensibles du panneau "Monitoring" (jobId, rôle "en service", salons, webhooks sortants) exigent la permission Discord **"Gérer le serveur"**, en plus des permissions du salon panneau lui-même — contrairement au reste du panneau, qui ne s'appuie que sur la visibilité du salon.
 
 ## Points d'extension
 
-- `src/services/autoReplyService.ts` : interface `AutoReplyMatcher`, un seul matcher mot-cle fourni. Ajouter un matcher IA (ex: Claude API) ici sans toucher au reste.
-- `src/services/webhookDispatcher.ts` : webhooks sortants signes HMAC (header `X-Signature-256`) sur les evenements `ticket.created`, `ticket.closed`, `ticket.escalated` — point de branchement generique pour un CRM/site externe.
+- `src/services/webhookDispatcher.ts` : webhooks sortants signés HMAC (header `X-Signature-256`) sur les événements `monitoring.duty`, `monitoring.recruitment`, `monitoring.storage`, `monitoring.invoice`, `monitoring.sale`, `absence.updated`, `order.updated`, `recruitment.updated`, plus `custom` (contenu libre, alimenté par une synchronisation Google Sheet — voir la section Monitoring) — point de branchement générique pour un CRM/site externe. Tous gérés sans accès DB, exclusivement depuis le panneau "Monitoring" (`WEBHOOK_EVENT_LABELS` y liste tous les types, quel que soit leur domaine).
 
-## A verifier sur le vrai serveur
+## À vérifier sur le vrai serveur
 
-Le signal de fermeture de ticket differe selon la configuration Ticket Tool (suppression du canal, renommage avec un prefixe, ou deplacement de categorie). Le bot couvre la suppression (`channelDelete`) et un renommage avec prefixe `closed-`/`ferme-` (`channelUpdate`, voir `src/events/channelUpdate.ts`) — a ajuster une fois observe en conditions reelles.
+Le signal de fermeture de ticket diffère selon la configuration Ticket Tool (suppression du canal, renommage avec un préfixe, ou déplacement de catégorie). Le bot couvre la suppression (`channelDelete`) et un renommage avec préfixe `closed-`/`ferme-` (`channelUpdate`, voir `src/events/channelUpdate.ts`) — à ajuster une fois observé en conditions réelles.
+
+Le parsing des logs de Monitoring (`src/services/monitoringParsers.ts`) est basé sur 5 exemples réels fournis par l'utilisateur, vérifiés au mot près — mais pas exhaustif de toutes les variantes possibles (ex: autres formulations de licenciement, autres types de log FiveM non capturés). Si un log n'est pas reconnu, il est quand même conservé brut (`MonitoringEvent`) et un avertissement est loggué : vérifier les logs du bot en cas de log de Monitoring qui ne déclenche pas l'effet attendu. De même, l'identification d'un coffre par sa `targetPosition` (position fixe du coffre, distincte de la position du joueur) suppose que le même coffre physique émet toujours exactement la même valeur — à confirmer en conditions réelles.
+
+Un message webhook FiveM peut contenir **plusieurs embeds à la fois** (observé en conditions réelles : un "fin de service" et un "prise de service" empilés dans le même message) — le bot les traite tous, dans l'ordre où Discord les reçoit, plutôt que de ne lire que le premier ; à garder en tête si un futur type de log venait à en grouper davantage.
+
+Le poids par article et la capacité de camion (facture Service client, voir plus haut) sont une fonctionnalité neuve, pas encore confrontée à de vraies commandes en conditions réelles : le calcul (somme des poids configurés × quantité, arrondi au camion supérieur) est simple mais suppose que les poids saisis par le staff sont cohérents entre eux (même unité, même référence) — rien ne le vérifie côté bot.
