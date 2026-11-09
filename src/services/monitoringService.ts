@@ -65,6 +65,10 @@ export async function ingestMonitoringMessage(message: Message<true>): Promise<b
     for (const embed of message.embeds) {
       const description = embed.description ?? "";
       const fields = Object.fromEntries(embed.fields.map((f) => [f.name, f.value]));
+      // Horodatage reel du log FiveM (affiche en bas de l'embed), distinct de l'heure d'envoi du webhook (sentAt,
+      // webhookDispatcher.ts) : un recepteur qui ne garde que sentAt date ses evenements a l'heure d'envoi, en
+      // retard de plusieurs minutes apres une panne reseau (le webhook est retente jusqu'a 30 min plus tard).
+      if (embed.timestamp) fields.logTimestamp = embed.timestamp;
 
       if (fields.jobId !== config.monitoringJobId) continue;
 
